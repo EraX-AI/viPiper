@@ -1,0 +1,81 @@
+FROM debian:bullseye as build
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+ENV LANG C.UTF-8
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends \
+        build-essential cmake ca-certificates curl pkg-config git
+
+WORKDIR /build
+
+COPY ./ ./
+RUN cmake -Bbuild -DCMAKE_INSTALL_PREFIX=install
+RUN cmake --build build --config Release
+RUN cmake --install build
+
+# Do a test run
+RUN ./build/piper --help
+
+# Build .tar.gz to keep symlinks
+WORKDIR /dist
+RUN mkdir -p piper && \
+    cp -dR /build/install/* ./piper/ && \
+    tar -czf "piper_${TARGETARCH}${TARGETVARIANT}.tar.gz" piper/
+
+# -----------------------------------------------------------------------------
+
+# FROM debian:bullseye as test
+# ARG TARGETARCH
+# ARG TARGETVARIANT
+
+# WORKDIR /test
+
+# COPY local/en-us/lessac/low/en-us-lessac-low.onnx \
+#      local/en-us/lessac/low/en-us-lessac-low.onnx.json ./
+
+# # Run Piper on a test sentence and verify that the WAV file isn't empty
+# COPY --from=build /dist/piper_*.tar.gz ./
+# RUN tar -xzf piper*.tar.gz
+# RUN echo 'This is a test.' | ./piper/piper -m en-us-lessac-low.onnx -f test.wav
+# RUN if [ ! -f test.wav ]; then exit 1; fi
+# RUN size="$(wc -c < test.wav)"; \
+#     if [ "${size}" -lt "1000" ]; then echo "File size is ${size} bytes"; exit 1; fi
+
+# -----------------------------------------------------------------------------
+
+FROM scratch
+
+# COPY --from=test /test/piper_*.tar.gz /test/test.wav ./
+COPY --from=build /dist/piper_*.tar.gz ./
+
+FROM build
+RUN apt update
+RUN apt install build-essential zlib1g-dev libncurses5-dev libgdbm-dev libnss3-dev libssl-dev libsqlite3-dev libreadline-dev libffi-dev curl libbz2-dev wget -y
+RUN mkdir /training
+WORKDIR /training
+RUN wget https://www.python.org/ftp/python/3.8.2/Python-3.8.2.tar.xz
+RUN tar -xJf Python-3.8.2.tar.xz
+WORKDIR Python-3.8.2
+RUN ./configure --enable-optimizations
+RUN make -j 8
+RUN make altinstall
+RUN apt install python3-pip -y
+RUN python3 --version
+RUN pip install piper-phonemize~=1.1.0
+RUN pip install numpy~=2.0.2
+RUN pip install cython>=0.29.0
+RUN pip install librosa>=0.9.2
+RUN pip install onnxruntime>=1.11.0
+RUN pip install pytorch-lightning~=1.7.0
+RUN pip install torch==1.13.1+cu117 torchvision==0.14.1+cu117 torchaudio==0.13.1 --extra-index-url https://download.pytorch.org/whl/cu117
+WORKDIR /training
+RUN mkdir src
+COPY src/ src/
+WORKDIR /training/src/python
+RUN pip install -r requirements_dev.txt
+RUN python3 setup.py install
+RUN bash build_monotonic_align.sh
+WORKDIR /training

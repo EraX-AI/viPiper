@@ -1,0 +1,446 @@
+import argparse
+import json
+import logging
+from pathlib import Path
+
+import torch
+from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint
+
+from .vits.lightning import VitsModel
+
+_LOGGER = logging.getLogger(__package__)
+
+
+def main():
+    logging.basicConfig(level=logging.DEBUG)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset-dir", required=True, help="Path to pre-processed dataset directory"
+    )
+    parser.add_argument(
+        "--checkpoint-epochs",
+        type=int,
+        help="Save checkpoint every N epochs (default: 1)",
+    )
+    parser.add_argument(
+        "--quality",
+        default="optimized",
+        choices=("x-low", "medium", "high", "efficient", "optimized"),
+        help="Quality/size of model (default: medium)",
+    )
+    parser.add_argument(
+        "--resume_from_single_speaker_checkpoint",
+        help="For multi-speaker models only. Converts a single-speaker checkpoint to multi-speaker and resumes training",
+    )
+    parser.add_argument(
+        "--resume_checkpoint",
+        help="Resume training from an optimized checkpoint (supports efficient models)",
+    )
+    parser.add_argument(
+        "--pruning-factor",
+        type=float,
+        default=0.5,
+        help="The pruning factor used when creating the efficient model (default: 0.5)",
+    )
+    parser.add_argument(
+        "--optimized-model-dir",
+        help="Path to an optimized model directory containing model.pt/ckpt and config.json",
+    )
+    parser.add_argument(
+        "--keep-layers",
+        type=int,
+        default=3,
+        help="Number of transformer layers for optimized models (default: 3)",
+    )
+    Trainer.add_argparse_args(parser)
+    VitsModel.add_model_specific_args(parser)
+    parser.add_argument("--seed", type=int, default=1234)
+    args = parser.parse_args()
+    _LOGGER.debug(args)
+
+    args.dataset_dir = Path(args.dataset_dir)
+    if not args.default_root_dir:
+        args.default_root_dir = args.dataset_dir
+
+    torch.backends.cudnn.benchmark = True
+    torch.manual_seed(args.seed)
+
+    # Determine config path - use optimized model config if provided
+    config_path = args.dataset_dir / "config.json"
+    if args.optimized_model_dir:
+        optimized_config = Path(args.optimized_model_dir) / "config.json"
+        if optimized_config.exists():
+            config_path = optimized_config
+            _LOGGER.info(f"Using optimized model config: {config_path}")
+
+    dataset_path = args.dataset_dir / "dataset.jsonl"
+
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        # See preprocess.py for format
+        config = json.load(config_file)
+        num_symbols = int(config["num_symbols"])
+        num_speakers = int(config["num_speakers"])
+        sample_rate = int(config["audio"]["sample_rate"])
+        
+        # Check for optimization metadata
+        optimization_info = {}
+        if "optimization" in config:
+            optimization_info = config["optimization"]
+            _LOGGER.info(f"Found optimization info: {optimization_info}")
+
+    trainer = Trainer.from_argparse_args(args)
+    if args.checkpoint_epochs is not None:
+        trainer.callbacks = [ModelCheckpoint(every_n_epochs=args.checkpoint_epochs)]
+        _LOGGER.debug(
+            "Checkpoints will be saved every %s epoch(s)", args.checkpoint_epochs
+        )
+
+    dict_args = vars(args)
+    
+    # Set model architecture based on quality
+    if args.quality == "x-low":
+        dict_args["hidden_channels"] = 96
+        dict_args["inter_channels"] = 96
+        dict_args["filter_channels"] = 384
+    elif args.quality == "high":
+        dict_args["resblock"] = "1"
+        dict_args["resblock_kernel_sizes"] = (3, 7, 11)
+        dict_args["resblock_dilation_sizes"] = (
+            (1, 3, 5),
+            (1, 3, 5),
+            (1, 3, 5),
+        )
+        dict_args["upsample_rates"] = (8, 8, 2, 2)
+        dict_args["upsample_initial_channel"] = 512
+        dict_args["upsample_kernel_sizes"] = (16, 16, 4, 4)
+        
+    elif args.quality == "optimized":
+        # Handle optimized models with reduced layers and dimensions
+        # First check for optimization info in config
+        pruning_factor = args.pruning_factor
+        n_layers = args.keep_layers  # Use the value from --keep-layers argument
+        
+        # Use config values if available
+        if optimization_info:
+            if "hidden_dim" in optimization_info:
+                hidden_dim = int(optimization_info["hidden_dim"])
+                dict_args["hidden_channels"] = hidden_dim
+                dict_args["inter_channels"] = hidden_dim
+                _LOGGER.debug(f"Using hidden dimension from config: {hidden_dim}")
+            
+            if "filter_dim" in optimization_info:
+                filter_dim = int(optimization_info["filter_dim"])
+                dict_args["filter_channels"] = filter_dim
+                _LOGGER.debug(f"Using filter dimension from config: {filter_dim}")
+            
+            if "n_layers" in optimization_info:
+                n_layers = int(optimization_info["n_layers"])
+                dict_args["n_layers"] = n_layers  # Important: explicitly set layers
+                _LOGGER.debug(f"Using layer count from config: {n_layers}")
+            
+            # Get upsample channel info
+            if "upsample_initial_channel" in config["audio"]:
+                target_channel = int(config["audio"]["upsample_initial_channel"])
+                _LOGGER.debug(f"Using upsample channel from config: {target_channel}")
+            else:
+                # Calculate from pruning factor
+                original_channel = 512
+                target_channel = int(original_channel * (1 - pruning_factor))
+            
+            # Always explicitly set the number of layers
+            dict_args["n_layers"] = n_layers
+            
+        else:
+            # Calculate dimensions if not found in config
+            original_hidden = 192
+            target_hidden = int(original_hidden * (1 - pruning_factor))
+            dict_args["hidden_channels"] = target_hidden
+            dict_args["inter_channels"] = target_hidden
+            
+            original_filter = 768
+            target_filter = int(original_filter * (1 - pruning_factor))
+            dict_args["filter_channels"] = target_filter
+            
+            # Calculate upsampling dimensions
+            original_channel = 512
+            target_channel = int(original_channel * (1 - pruning_factor))
+            
+            # Explicitly set the number of layers
+            dict_args["n_layers"] = n_layers
+        
+        # Set remaining parameters
+        dict_args["resblock"] = "1"
+        dict_args["resblock_kernel_sizes"] = (3, 7, 11)
+        dict_args["resblock_dilation_sizes"] = (
+            (1, 3, 5),
+            (1, 3, 5),
+            (1, 3, 5),
+        )
+        dict_args["upsample_rates"] = (8, 8, 4)  # 3-stage upsampling
+        dict_args["upsample_initial_channel"] = target_channel
+        dict_args["upsample_kernel_sizes"] = (16, 16, 8)
+        
+        _LOGGER.info(
+            f"Optimized model settings: layers={dict_args.get('n_layers', n_layers)}, "
+            f"hidden={dict_args.get('hidden_channels', target_hidden if 'target_hidden' in locals() else 'unknown')}, "
+            f"filter={dict_args.get('filter_channels', target_filter if 'target_filter' in locals() else 'unknown')}, "
+            f"channels={target_channel}, "
+            f"pruning_factor={pruning_factor:.2f}"
+        )
+        
+    # After creating the model
+    model = VitsModel(
+        num_symbols=num_symbols,
+        num_speakers=num_speakers,
+        sample_rate=sample_rate,
+        dataset=[dataset_path],
+        **dict_args,
+    )
+    
+    # Add this debug info
+    _LOGGER.info(f"Model created with parameters:")
+    _LOGGER.info(f"  - hidden_channels: {model.model_g.hidden_channels}")
+    _LOGGER.info(f"  - n_layers: {model.model_g.n_layers}")
+    _LOGGER.info(f"  - filter_channels: {model.model_g.filter_channels}")
+    
+    # Handle loading from optimized model dir
+    if args.optimized_model_dir:
+        model_path = Path(args.optimized_model_dir) / "model.pt"
+        if not model_path.exists():
+            model_path = Path(args.optimized_model_dir) / "model.ckpt"
+        
+        if model_path.exists():
+            _LOGGER.info(f"Loading optimized model from {model_path}")
+            try:
+                # Load optimized model
+                checkpoint = torch.load(model_path, map_location='cpu')
+                
+                if isinstance(checkpoint, dict) and 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                    
+                    # Extract generator and discriminator weights
+                    model_g_dict = {k.replace('model_g.', ''): v for k, v in state_dict.items() 
+                                  if isinstance(k, str) and (k.startswith('model_g.') or not '.' in k)}
+                    
+                    model_d_dict = {k.replace('model_d.', ''): v for k, v in state_dict.items() 
+                                  if isinstance(k, str) and k.startswith('model_d.')}
+                    
+                    # If we didn't find properly prefixed weights, try finding them directly
+                    if not model_g_dict and not model_d_dict:
+                        # Try to infer which keys belong to which model
+                        model_g_dict = {}
+                        model_d_dict = {}
+                        
+                        for k, v in state_dict.items():
+                            if not isinstance(k, str):
+                                continue
+                            if any(x in k for x in ['enc_', 'dec.', 'flow.', 'dp.']):
+                                model_g_dict[k] = v
+                            elif any(x in k for x in ['disc', 'mpd.', 'msd.', 'discriminator']):
+                                model_d_dict[k] = v
+                    
+                    # Report weight stats
+                    _LOGGER.info(f"Found {len(model_g_dict)} generator weights and {len(model_d_dict)} discriminator weights")
+                    
+                    # Load weights with improved flexibility
+                    if model_g_dict:
+                        load_state_dict_flexible(model.model_g, model_g_dict)
+                    if model_d_dict:
+                        load_state_dict_flexible(model.model_d, model_d_dict)
+                    
+                    _LOGGER.info("Successfully loaded weights from optimized model")
+                else:
+                    _LOGGER.error("Invalid model format in optimized model directory")
+            except Exception as e:
+                _LOGGER.error(f"Error loading optimized model: {e}")
+                import traceback
+                traceback.print_exc()
+
+    # Handle loading from optimized checkpoint
+    elif args.resume_checkpoint:
+        _LOGGER.info(f"Loading optimized checkpoint: {args.resume_checkpoint}")
+        try:
+            # Try to load checkpoint
+            checkpoint = torch.load(args.resume_checkpoint, map_location='cpu')
+            
+            # Determine source of model weights
+            if isinstance(checkpoint, dict):
+                if 'model' in checkpoint and isinstance(checkpoint['model'], dict):
+                    # Direct Piper format
+                    state_dict = checkpoint['model']
+                    _LOGGER.debug("Using 'model' key from checkpoint")
+                elif 'state_dict' in checkpoint:
+                    # Lightning checkpoint format
+                    state_dict = checkpoint['state_dict']
+                    _LOGGER.debug("Using 'state_dict' key from checkpoint")
+                else:
+                    # Assume direct state dict
+                    state_dict = checkpoint
+                    _LOGGER.debug("Using checkpoint directly as state dict")
+            else:
+                _LOGGER.error("Checkpoint is not a dictionary")
+                raise ValueError("Invalid checkpoint format")
+                
+            # Extract model_g and model_d weights
+            model_g_dict = {k.replace('model_g.', ''): v for k, v in state_dict.items() 
+                          if isinstance(k, str) and k.startswith('model_g.')}
+            model_d_dict = {k.replace('model_d.', ''): v for k, v in state_dict.items() 
+                          if isinstance(k, str) and k.startswith('model_d.')}
+            
+            # If we didn't find properly prefixed weights, try finding them directly
+            if not model_g_dict and not model_d_dict:
+                _LOGGER.warning("Could not find prefixed weights, trying direct detection")
+                # Try to infer which keys belong to which model
+                model_g_dict = {}
+                model_d_dict = {}
+                
+                for k, v in state_dict.items():
+                    if not isinstance(k, str):
+                        continue
+                    if any(x in k for x in ['enc_', 'dec.', 'flow.', 'dp.']):
+                        model_g_dict[k] = v
+                    elif any(x in k for x in ['disc', 'mpd.', 'msd.', 'discriminator']):
+                        model_d_dict[k] = v
+            
+            # Report weight stats
+            _LOGGER.info(f"Found {len(model_g_dict)} generator weights and {len(model_d_dict)} discriminator weights")
+            
+            # Load weights with improved handling for optimized models
+            if model_g_dict:
+                load_state_dict_flexible(model.model_g, model_g_dict)
+            if model_d_dict:
+                load_state_dict_flexible(model.model_d, model_d_dict)
+                
+            _LOGGER.info("Successfully loaded weights from optimized model")
+            
+        except Exception as e:
+            _LOGGER.error(f"Failed to load checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
+    elif args.resume_from_single_speaker_checkpoint:
+        assert (
+            num_speakers > 1
+        ), "--resume_from_single_speaker_checkpoint is only for multi-speaker models. Use --resume_checkpoint for single-speaker models."
+
+        # Load single-speaker checkpoint
+        _LOGGER.debug(
+            "Resuming from single-speaker checkpoint: %s",
+            args.resume_from_single_speaker_checkpoint,
+        )
+        model_single = VitsModel.load_from_checkpoint(
+            args.resume_from_single_speaker_checkpoint,
+            dataset=None,
+        )
+        g_dict = model_single.model_g.state_dict()
+        for key in list(g_dict.keys()):
+            # Remove keys that can't be copied over due to missing speaker embedding
+            if (
+                key.startswith("dec.cond")
+                or key.startswith("dp.cond")
+                or ("enc.cond_layer" in key)
+            ):
+                g_dict.pop(key, None)
+
+        # Copy over the multi-speaker model, excluding keys related to the
+        # speaker embedding (which is missing from the single-speaker model).
+        load_state_dict_flexible(model.model_g, g_dict)
+        load_state_dict_flexible(model.model_d, model_single.model_d.state_dict())
+        _LOGGER.info(
+            "Successfully converted single-speaker checkpoint to multi-speaker"
+        )
+
+    trainer.fit(model)
+
+
+def load_state_dict(model, saved_state_dict):
+    """
+    Basic state dict loading function.
+    
+    This allows loading weights even when the model architecture has been modified,
+    which is crucial for finetuning pruned/optimized models.
+    """
+    state_dict = model.state_dict()
+    new_state_dict = {}
+    
+    # Track metrics for reporting
+    matched_keys = 0
+    missing_keys = 0
+    
+    for k, v in state_dict.items():
+        if k in saved_state_dict:
+            # Use saved value
+            new_state_dict[k] = saved_state_dict[k]
+            matched_keys += 1
+        else:
+            # Use initialized value
+            _LOGGER.debug("%s is not in the checkpoint", k)
+            new_state_dict[k] = v
+            missing_keys += 1
+    
+    _LOGGER.info(f"Loaded state dict: {matched_keys} matched keys, {missing_keys} missing keys")
+    model.load_state_dict(new_state_dict)
+
+
+def load_state_dict_flexible(model, saved_state_dict):
+    """
+    Enhanced state dict loading function for optimized models with better dimension mismatch handling.
+    """
+    state_dict = model.state_dict()
+    new_state_dict = {}
+    
+    # Track metrics for reporting
+    matched_keys = 0
+    missing_keys = 0
+    size_mismatch = 0
+    
+    for k, v in state_dict.items():
+        if k in saved_state_dict:
+            saved_tensor = saved_state_dict[k]
+            
+            # Check for dimension mismatch
+            if isinstance(v, torch.Tensor) and isinstance(saved_tensor, torch.Tensor):
+                if v.shape == saved_tensor.shape:
+                    # Shapes match, use saved value
+                    new_state_dict[k] = saved_tensor
+                    matched_keys += 1
+                else:
+                    # Shapes don't match, handle the mismatch
+                    _LOGGER.debug(f"Size mismatch for {k}: model={v.shape}, checkpoint={saved_tensor.shape}")
+                    size_mismatch += 1
+                    
+                    # For incompatible shapes, it's better to use model's initialized weights
+                    # rather than attempting partial loading which can lead to instability
+                    new_state_dict[k] = v  # Use model's initialized weights for this parameter
+            else:
+                # Not a tensor, use saved value
+                new_state_dict[k] = saved_tensor
+                matched_keys += 1
+        else:
+            # Not in saved state dict, use initialized value
+            _LOGGER.debug(f"{k} is not in the checkpoint")
+            new_state_dict[k] = v
+            missing_keys += 1
+    
+    _LOGGER.info(f"Loaded state dict: {matched_keys} matched keys, {missing_keys} missing keys, {size_mismatch} size mismatches")
+    model.load_state_dict(new_state_dict)
+    
+# -----------------------------------------------------------------------------
+
+
+if __name__ == "__main__":
+    main()
+
+'''
+python -m piper.train \
+    --dataset-dir /path/to/your/dataset \
+    --quality optimized \
+    --optimized-model-dir ./optimized_model \
+    --n-layers 3 \
+    --pruning-factor 0.5 \
+    --epochs 100 \
+    --batch-size 32
+'''
