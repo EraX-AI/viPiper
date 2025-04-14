@@ -279,8 +279,8 @@ def main():
     )
     parser.add_argument(
         "--cosine_scheduler",
-        type=float,
-        default=0.1,
+        type=bool,
+        default=True,
         help="Use Cosine instead of standard Piper optimizer/scheduler"
     )
     Trainer.add_argparse_args(parser)
