@@ -39,8 +39,8 @@ WORLD_SIZE=4 python3 -m piper_train --dataset-dir /data/piper/steve_combined_mul
 *   **Smart Initialization:** Whether training from scratch or finetuning, our weight initialization techniques aim for faster convergence and better results.
 
 **Future Contributions:**
-
-Stay tuned! We are actively training a new model using viPiper's capabilities and look forward to sharing it soon. Contact us for contribution or commercial implementation at nguyen@hatto.com
+*  Stay tuned! We are actively training a new Vietnamese model using viPiper's capabilities and look forward to sharing it soon.
+*  Contact us for contribution or commercial implementation at nguyen@hatto.com
 
 **License:**
 
