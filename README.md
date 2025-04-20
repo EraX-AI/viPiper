@@ -1,6 +1,6 @@
 ## Introducing viPiper: Advancing TTS Training and Optimization
 
-Built upon the strong foundation of the Piper TTS project, **viPiper** represents our contribution towards a more flexible and controllable TTS development experience. We've focused on enhancing the training pipeline and introducing novel features for model optimization, shared with the community in the spirit of open collaboration.
+Built upon the strong foundation of the Piper TTS project (https://github.com/rhasspy/piper), **viPiper** represents our contribution towards a more flexible and controllable TTS development experience. We've focused on enhancing the training pipeline and introducing novel features for model optimization, shared with the community in the spirit of open collaboration.
 
 **What's New in Version 1.0:**
 
