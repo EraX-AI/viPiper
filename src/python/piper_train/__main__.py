@@ -139,6 +139,81 @@ For different components of the VITS architecture, I use specific initialization
 This comprehensive approach provides a good starting point for training a VITS model from scratch, with each component initialized according to its specific role in the network, following best practices from TTS research.
 '''
 
+import torch
+import torch.nn as nn
+import math
+import logging
+
+# Assume _LOGGER is already defined as in your script
+# _LOGGER = logging.getLogger(__package__) # Or appropriate logger setup
+
+def init_weights_pytorch_default(model):
+    """Initialize model weights using PyTorch's default initialization methods.
+
+    Args:
+        model: The model (e.g., VitsModel instance) to initialize.
+
+    This function iterates through model modules and applies the standard
+    PyTorch initializations for common layer types like Linear, Conv1d,
+    ConvTranspose1d, Embedding, and LayerNorm. This serves as a baseline
+    initialization strategy.
+    """
+    _LOGGER.info("Initializing model weights using PyTorch default methods")
+
+    for name, module in model.named_modules():
+        try:
+            if isinstance(module, nn.Linear):
+                # Default: Kaiming uniform for weight, uniform based on fan_in for bias
+                if hasattr(module, 'weight') and module.weight is not None:
+                    nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
+                if hasattr(module, 'bias') and module.bias is not None:
+                    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(module.weight)
+                    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                    nn.init.uniform_(module.bias, -bound, bound)
+                _LOGGER.debug(f"Initialized Linear layer {name} with PyTorch defaults")
+
+            elif isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)):
+                # Default: Kaiming uniform for weight, uniform based on fan_in for bias
+                if hasattr(module, 'weight') and module.weight is not None:
+                    nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
+                if hasattr(module, 'bias') and module.bias is not None:
+                    # Calculate fan_in for Conv layers based on groups
+                    # Note: This replicates the internal logic more closely
+                    num_input_fmaps = module.weight.size(1) * module.groups
+                    receptive_field_size = 1
+                    if module.weight.dim() > 2:
+                        receptive_field_size = module.weight[0][0].numel()
+                    fan_in = num_input_fmaps * receptive_field_size
+
+                    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+                    nn.init.uniform_(module.bias, -bound, bound)
+                _LOGGER.debug(f"Initialized Conv layer {name} with PyTorch defaults")
+
+
+            elif isinstance(module, nn.Embedding):
+                # Default: Normal distribution mean=0, std=1
+                if hasattr(module, 'weight') and module.weight is not None:
+                    nn.init.normal_(module.weight, mean=0.0, std=1.0)
+                # Note: std=1.0 is the literal default, but often customized (like your std=0.02)
+                _LOGGER.debug(f"Initialized Embedding layer {name} with PyTorch defaults (std=1.0)")
+
+            elif isinstance(module, nn.LayerNorm):
+                # Default: weight=1, bias=0
+                if hasattr(module, 'weight') and module.weight is not None:
+                    nn.init.ones_(module.weight)
+                if hasattr(module, 'bias') and module.bias is not None:
+                    nn.init.zeros_(module.bias)
+                _LOGGER.debug(f"Initialized LayerNorm layer {name} with PyTorch defaults")
+
+            # Add elif blocks here for other layer types if needed (e.g., BatchNorm)
+
+        except Exception as e:
+            _LOGGER.warning(f"Could not initialize {name} ({type(module)}): {e}")
+
+
+    _LOGGER.info("Model weights initialized using PyTorch default methods")
+    return model
+    
 def load_state_dict(model, saved_state_dict):
     """
     Basic state dict loading function.
@@ -211,7 +286,150 @@ def load_state_dict_flexible(model, saved_state_dict):
     _LOGGER.info(f"Loaded state dict: {matched_keys} matched keys, {missing_keys} missing keys, {size_mismatch} size mismatches")
     model.load_state_dict(new_state_dict)
 
+import random
+import torch
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import Callback
+import torchaudio # Add this import if not already present
 
+class AudioSampleLogger(Callback):
+    """
+    Logs audio samples generated from random validation utterances during training
+    and saves them to a 'samples' directory.
+    """
+    def __init__(self, frequency: int = 2000, num_samples: int = 2, scales: list = [0.667, 1.0, 0.8]):
+        """
+        Args:
+            frequency (int): Log/Save audio every N training steps.
+            num_samples (int): Number of random validation samples to generate.
+            scales (list): Inference scales [noise_scale, length_scale, noise_scale_w].
+        """
+        super().__init__()
+        self.frequency = frequency
+        self.num_samples = num_samples
+        self.scales = scales
+        _LOGGER.info(f"AudioSampleLogger initialized: logging/saving {num_samples} samples every {frequency} steps.")
+
+    def on_train_batch_end(
+        self,
+        trainer: "pl.Trainer",
+        pl_module: "pl.LightningModule",
+        outputs,
+        batch,
+        batch_idx: int
+    ):
+        """Called when the train batch ends."""
+        step = trainer.global_step
+        # Check conditions for logging/saving
+        if not hasattr(pl_module, '_val_dataset') or pl_module._val_dataset is None:
+            if step > 0 and (step + 1) % self.frequency == 0:
+                _LOGGER.warning("Validation dataset not found in model for sample logging/saving.")
+            return
+        if len(pl_module._val_dataset) == 0:
+            if step > 0 and (step + 1) % self.frequency == 0:
+                _LOGGER.warning("Validation dataset is empty, cannot log/save samples.")
+            return
+
+        # Proceed if it's the right step and validation set is valid
+        if (step + 1) % self.frequency == 0 and step > 0:
+            _LOGGER.info(f"Generating validation audio samples at step {step + 1}...")
+
+            # --- Path setup for saving samples ---
+            try:
+                # Access default_root_dir reliably from the trainer
+                save_dir_base = Path(trainer.default_root_dir)
+                samples_dir = save_dir_base / "samples"
+                samples_dir.mkdir(parents=True, exist_ok=True) # Create dir if needed
+                _LOGGER.debug(f"Audio samples will be saved to: {samples_dir}")
+            except Exception as e:
+                 _LOGGER.error(f"Could not create samples directory under {trainer.default_root_dir}: {e}")
+                 return # Cannot save if directory fails
+
+            # Check logger availability (still useful for TensorBoard etc.)
+            logger_available = trainer.logger is not None and hasattr(trainer.logger, 'experiment')
+            if not logger_available:
+                _LOGGER.warning("Logger not available for sample logging (will only save files).")
+
+            original_device = pl_module.device
+            try:
+                pl_module.eval() # Set model to eval mode
+
+                num_available = len(pl_module._val_dataset)
+                sample_indices = random.sample(range(num_available), min(self.num_samples, num_available))
+
+                with torch.no_grad():
+                    for i, idx in enumerate(sample_indices):
+                        try:
+                            utt = pl_module._val_dataset[idx]
+                            # Ensure data tensors are on the correct device
+                            text = utt.phoneme_ids.unsqueeze(0).to(pl_module.device)
+                            text_lengths = torch.LongTensor([len(utt.phoneme_ids)]).to(pl_module.device)
+                            sid = None
+                            if pl_module.hparams.num_speakers > 1 and utt.speaker_id is not None:
+                                if isinstance(utt.speaker_id, torch.Tensor) and utt.speaker_id.ndim == 0:
+                                     sid = utt.speaker_id.unsqueeze(0).to(pl_module.device)
+                                elif isinstance(utt.speaker_id, int):
+                                     sid = torch.LongTensor([utt.speaker_id]).to(pl_module.device)
+                                else: sid = utt.speaker_id.to(pl_module.device) # Assume tensor
+
+                            # Perform inference
+                            audio_tensor = pl_module(text, text_lengths, self.scales, sid=sid).detach().cpu()
+
+                            # Scale for better listening volume
+                            max_amp = torch.max(torch.abs(audio_tensor))
+                            if max_amp > 1e-4:
+                                audio_tensor = audio_tensor * (0.95 / max_amp)
+
+                            sample_rate = pl_module.hparams.sample_rate
+                            tag_name = f"val_sample_{i}_step_{step + 1}"
+
+                            # --- Save the audio file ---
+                            output_filename = samples_dir / f"{tag_name}.wav"
+                            try:
+                                # Ensure tensor is 2D (channels, time) for torchaudio
+                                if audio_tensor.ndim == 1:
+                                    audio_tensor_save = audio_tensor.unsqueeze(0)
+                                else:
+                                     audio_tensor_save = audio_tensor # Assume already (1, time) or (channels, time)
+
+                                torchaudio.save(
+                                    str(output_filename), # Path needs to be string
+                                    audio_tensor_save,
+                                    sample_rate
+                                )
+                                _LOGGER.info(f"Saved audio sample: {output_filename}")
+                            except Exception as e_save:
+                                _LOGGER.error(f"Failed to save audio sample {output_filename}: {e_save}")
+
+                            # --- Log to TensorBoard (if available) ---
+                            if logger_available:
+                                try:
+                                    # Ensure tensor is 2D (1, num_samples) for add_audio
+                                    if audio_tensor.ndim == 1:
+                                        audio_tensor_log = audio_tensor.unsqueeze(0)
+                                    else:
+                                        audio_tensor_log = audio_tensor
+
+                                    trainer.logger.experiment.add_audio(
+                                        tag_name,
+                                        audio_tensor_log,
+                                        global_step=step + 1,
+                                        sample_rate=sample_rate,
+                                    )
+                                    _LOGGER.debug(f"Logged audio to logger: {tag_name}")
+                                except Exception as e_log:
+                                     _LOGGER.error(f"Failed to log audio sample {tag_name} to logger: {e_log}")
+
+
+                        except Exception as e_inner:
+                            _LOGGER.error(f"Error generating/processing sample {i} (index {idx}) at step {step + 1}: {e_inner}", exc_info=True)
+
+            except Exception as e_outer:
+                 _LOGGER.error(f"Error during audio sample generation outer loop at step {step + 1}: {e_outer}", exc_info=True)
+            finally:
+                pl_module.train() # Ensure model is back in train mode
+                # pl_module.to(original_device) # Move back if needed (usually not required)
+                
 def main():
     logging.basicConfig(level=logging.DEBUG)
 
@@ -227,7 +445,7 @@ def main():
     parser.add_argument(
         "--quality",
         default="optimized",
-        choices=("x-low", "medium", "high", "efficient", "optimized"),
+        choices=("x-low", "x-low_extra", "medium", "high", "efficient", "optimized"),
         help="Quality/size of model (default: medium)",
     )
     parser.add_argument(
@@ -241,7 +459,7 @@ def main():
     parser.add_argument(
         "--pruning-factor",
         type=float,
-        default=0.5,
+        default=0.0,
         help="The pruning factor used when creating the efficient model (default: 0.5)",
     )
     parser.add_argument(
@@ -251,7 +469,7 @@ def main():
     parser.add_argument(
         "--keep-layers",
         type=int,
-        default=3,
+        default=6,
         help="Number of transformer layers for optimized models (default: 3)",
     )
     parser.add_argument(
@@ -282,6 +500,30 @@ def main():
         type=bool,
         default=True,
         help="Use Cosine instead of standard Piper optimizer/scheduler"
+    )
+    parser.add_argument(
+        "--smart_init",
+        type=bool,
+        default=False,
+        help="Use Steve's smart initializing or Pytorch"
+    )
+    parser.add_argument(
+        "--sample_steps",
+        type=int,
+        default=2000,
+        help="Generate 2 samples for every sample_steps steps"
+    )
+    parser.add_argument(
+        "--max_epoch_keeps",
+        type=int,
+        default=50,
+        help="Maximum good epochs to keep"
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=8,
+        help="Number of workers for DataLoader"
     )
     Trainer.add_argparse_args(parser)
     VitsModel.add_model_specific_args(parser)
@@ -342,19 +584,49 @@ def main():
     from pytorch_lightning.callbacks import RichProgressBar
 
     trainer = Trainer.from_argparse_args(args)
+    checkpoint_callback = None
     if args.checkpoint_epochs is not None:
-        trainer.callbacks = [ModelCheckpoint(every_n_epochs=args.checkpoint_epochs), RichProgressBar()]
-        _LOGGER.debug(
-            "Checkpoints will be saved every %s epoch(s)", args.checkpoint_epochs
+        # Configure ModelCheckpoint to save top 50 based on val_loss
+        # and name files uniquely by epoch and loss.
+        checkpoint_callback = ModelCheckpoint(
+            dirpath=Path(args.weights_save_path) if args.weights_save_path else Path(args.default_root_dir) / "checkpoints",
+            filename='piper-{epoch:03d}-{val_loss:.2f}', # Unique names
+            monitor='val_loss',             # Metric to monitor
+            mode='min',                     # Minimize validation loss
+            save_top_k=args.max_epoch_keeps, #Keep top max_epoch_keeps checkpoints
+            every_n_epochs=args.checkpoint_epochs, # Save frequency
+            save_last=True               # Also save the very last one
         )
+        trainer.callbacks.append(checkpoint_callback) # Append instead of overwriting
+        _LOGGER.debug(
+            "Checkpoints will be saved every %s epoch(s), keeping top 50 based on val_loss", args.checkpoint_epochs
+        )
+        # Ensure RichProgressBar is also added if not already present by default from Trainer args
+        if not any(isinstance(cb, RichProgressBar) for cb in trainer.callbacks):
+             trainer.callbacks.append(RichProgressBar())
+    else:
+        # Add progress bar even if checkpointing is disabled
+        if not any(isinstance(cb, RichProgressBar) for cb in trainer.callbacks):
+             trainer.callbacks.append(RichProgressBar())
 
+    audio_logger_callback = AudioSampleLogger(frequency=args.sample_steps, num_samples=2)
+    trainer.callbacks.append(audio_logger_callback)
+    
     dict_args = vars(args)
     
-    # Set model architecture based on quality
+                
+    # Set model architecture based on quality            
     if args.quality == "x-low":
         dict_args["hidden_channels"] = 96
         dict_args["inter_channels"] = 96
         dict_args["filter_channels"] = 384
+    
+    # Set model architecture based on quality
+    elif args.quality == "x-low_extra":
+        dict_args["hidden_channels"] = 96
+        dict_args["inter_channels"] = 96
+        dict_args["filter_channels"] = 384
+        dict_args["n_layers"] = args.keep_layers
     
     elif args.quality == "high":
         dict_args["resblock"] = "1"
@@ -458,10 +730,15 @@ def main():
     _LOGGER.info(f"  - filter_channels: {model.model_g.filter_channels}")
     
     # If from_scratch is specified, initialize weights and skip loading checkpoints
-    if args.from_scratch and args.quality == "optimized":
-        _LOGGER.info("Training from scratch with custom VITS weight initialization")
-        model = init_weights_vits(model)
-        _LOGGER.info("Model initialized with custom weights for from-scratch training")
+    if args.from_scratch: # and args.quality == "optimized":
+        if args.smart_init:
+            _LOGGER.info("Training from scratch with STEVE's VITS weight initialization")
+            model = init_weights_vits(model)
+        else:
+            _LOGGER.info("Training from scratch with PyTorch's VITS weight initialization")
+            model = init_weights_pytorch_default(model)
+
+        _LOGGER.info("Model initialized with random weights for from-scratch training")
     
     # Handle loading from optimized model dir (only if not training from scratch)
     elif args.optimized_model_dir:
