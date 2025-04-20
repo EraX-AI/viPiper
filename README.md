@@ -54,7 +54,7 @@ To cite viPiper in your publications:
 
 ```bibtex
 @misc{viPiper_EraX_2025,
-  author       = {Steve Nguyen Anh Nguyen},
+  author       = {Steve Nguyen Anh Nguyen nguyen@hatto.com},
   title        = {viPiper: Enhanced TTS Training, Pruning, and Vietnamese Voice Synthesis},
   year         = {2024},
   publisher    = {GitHub},
