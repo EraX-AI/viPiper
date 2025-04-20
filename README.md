@@ -12,7 +12,7 @@ Built upon the strong foundation of the Piper TTS project (https://github.com/rh
 ```
 docker run --rm -it --gpus '"device=0,1,2,3"' --shm-size 64G -v ./data:/data thusinh1969/piper_prune_v1:latest bash
 ```
-*   A comprehensive **starting script** can be as sophisticated as for training **from scratch**:
+*   A comprehensive **starting script** (run inside docker) can be as sophisticated as for training **from scratch**:
 ```
 WORLD_SIZE=4 python3 -m piper_train --dataset-dir /data/piper/steve_combined_multi_extra_char/to_train \
 --default_root_dir  /data/piper/steve_combined_multi_extra_char/to_train/outputs \
