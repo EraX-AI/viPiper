@@ -12,7 +12,7 @@ Built upon the strong foundation of the Piper TTS project (https://github.com/rh
 ```
 docker run --rm -it --gpus '"device=0,1,2,3"' --shm-size 64G -v ./data:/data thusinh1969/piper_prune_v1:latest bash
 ```
-*   A comprehensive **starting script** (run inside docker) can be as sophisticated as for training **from scratch**:
+*   A comprehensive **starting script** (run inside docker) can be as sophisticated as for training **from scratch** for medium-spec model on 3090 24G:
 ```
 WORLD_SIZE=4 python3 -m piper_train --dataset-dir /data/piper/steve_combined_multi_extra_char/to_train \
 --default_root_dir  /data/piper/steve_combined_multi_extra_char/to_train/outputs \
@@ -22,7 +22,7 @@ WORLD_SIZE=4 python3 -m piper_train --dataset-dir /data/piper/steve_combined_mul
 --pruning-factor 0.0 \
 --precision 32 \
 --amp_backend native \
---accelerator 'gpu' --devices 4 --strategy ddp --seed 42 --enable_checkpointing true --batch-size 48 --max-phoneme-ids 400 --accumulate_grad_batches 2 \
+--accelerator 'gpu' --devices 4 --strategy ddp --seed 42 --enable_checkpointing true --batch-size 32 --max-phoneme-ids 400 --accumulate_grad_batches 2 \
 --max_epochs 500 --validation-split 0.005 --num-test-examples 100 --check_val_every_n_epoch 1 --log_every_n_steps 10 --logger true \
 --gradient_clip_val 1.0 --gradient_clip_algorithm 'norm' \
 --auto_lr_find true --learning_rate 2e-4 --weight_decay 0.02 --warmup_ratio 0.05 --cosine_scheduler true --from_scratch \
