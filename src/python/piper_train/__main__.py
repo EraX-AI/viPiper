@@ -286,16 +286,20 @@ def load_state_dict_flexible(model, saved_state_dict):
     _LOGGER.info(f"Loaded state dict: {matched_keys} matched keys, {missing_keys} missing keys, {size_mismatch} size mismatches")
     model.load_state_dict(new_state_dict)
 
-import random
 import torch
-import pytorch_lightning as pl
+import torchaudio # Make sure this is imported at the top of the file if not already
+from pathlib import Path
+import random
+import logging # Ensure logging is imported
 from pytorch_lightning.callbacks import Callback
-import torchaudio # Add this import if not already present
+import pytorch_lightning as pl
+
+_LOGGER = logging.getLogger(__package__) # Ensure logger is defined
 
 class AudioSampleLogger(Callback):
     """
     Logs audio samples generated from random validation utterances during training
-    and saves them to a 'samples' directory.
+    and saves them to a 'samples' directory. Runs only on rank 0.
     """
     def __init__(self, frequency: int = 2000, num_samples: int = 2, scales: list = [0.667, 1.0, 0.8]):
         """
@@ -318,50 +322,63 @@ class AudioSampleLogger(Callback):
         batch,
         batch_idx: int
     ):
-        """Called when the train batch ends."""
-        step = trainer.global_step
-        # Check conditions for logging/saving
-        if not hasattr(pl_module, '_val_dataset') or pl_module._val_dataset is None:
-            if step > 0 and (step + 1) % self.frequency == 0:
-                _LOGGER.warning("Validation dataset not found in model for sample logging/saving.")
+        """Called when the train batch ends. Generates and saves/logs audio samples on rank 0."""
+
+        # --- Only execute on the main process (rank 0) in distributed training ---
+        if not trainer.is_global_zero:
             return
-        if len(pl_module._val_dataset) == 0:
-            if step > 0 and (step + 1) % self.frequency == 0:
-                _LOGGER.warning("Validation dataset is empty, cannot log/save samples.")
+        # --------------------------------------------------------------------------
+
+        step = trainer.global_step
+
+        # Check conditions for logging/saving (now only checked on rank 0)
+        # 1. Check if validation dataset exists on the model
+        if not hasattr(pl_module, '_val_dataset') or pl_module._val_dataset is None:
+            if step > 0 and step % self.frequency == 0:
+                _LOGGER.warning("Validation dataset not found in model for sample logging/saving (rank 0).")
             return
 
-        # Proceed if it's the right step and validation set is valid
-        if (step + 1) % self.frequency == 0 and step > 0:
-            _LOGGER.info(f"Generating validation audio samples at step {step + 1}...")
+        # 2. Check if validation dataset is empty
+        if len(pl_module._val_dataset) == 0:
+            if step > 0 and step % self.frequency == 0:
+                _LOGGER.warning("Validation dataset is empty, cannot log/save samples (rank 0).")
+            return
+
+        # Proceed if it's the correct step and the validation set is valid
+        if step % self.frequency == 0 and step > 0:
+            _LOGGER.info(f"Generating validation audio samples at step {step + 1} (rank 0)...")
 
             # --- Path setup for saving samples ---
             try:
-                # Access default_root_dir reliably from the trainer
                 save_dir_base = Path(trainer.default_root_dir)
                 samples_dir = save_dir_base / "samples"
-                samples_dir.mkdir(parents=True, exist_ok=True) # Create dir if needed
+                samples_dir.mkdir(parents=True, exist_ok=True)
                 _LOGGER.debug(f"Audio samples will be saved to: {samples_dir}")
             except Exception as e:
                  _LOGGER.error(f"Could not create samples directory under {trainer.default_root_dir}: {e}")
-                 return # Cannot save if directory fails
+                 return
 
-            # Check logger availability (still useful for TensorBoard etc.)
             logger_available = trainer.logger is not None and hasattr(trainer.logger, 'experiment')
             if not logger_available:
                 _LOGGER.warning("Logger not available for sample logging (will only save files).")
 
+            # --- Generate and process samples ---
             original_device = pl_module.device
             try:
-                pl_module.eval() # Set model to eval mode
+                pl_module.eval() # Set model to evaluation mode
 
-                num_available = len(pl_module._val_dataset)
-                sample_indices = random.sample(range(num_available), min(self.num_samples, num_available))
+                num_available_samples = len(pl_module._val_dataset)
+                num_to_generate = min(self.num_samples, num_available_samples)
+                if num_to_generate > 0:
+                     sample_indices = random.sample(range(num_available_samples), num_to_generate)
+                else:
+                     sample_indices = []
 
                 with torch.no_grad():
                     for i, idx in enumerate(sample_indices):
                         try:
                             utt = pl_module._val_dataset[idx]
-                            # Ensure data tensors are on the correct device
+
                             text = utt.phoneme_ids.unsqueeze(0).to(pl_module.device)
                             text_lengths = torch.LongTensor([len(utt.phoneme_ids)]).to(pl_module.device)
                             sid = None
@@ -370,12 +387,45 @@ class AudioSampleLogger(Callback):
                                      sid = utt.speaker_id.unsqueeze(0).to(pl_module.device)
                                 elif isinstance(utt.speaker_id, int):
                                      sid = torch.LongTensor([utt.speaker_id]).to(pl_module.device)
-                                else: sid = utt.speaker_id.to(pl_module.device) # Assume tensor
+                                else:
+                                     sid = utt.speaker_id.to(pl_module.device)
 
-                            # Perform inference
-                            audio_tensor = pl_module(text, text_lengths, self.scales, sid=sid).detach().cpu()
+                            # --- Perform inference ---
+                            # Output might be (1, 1, time)
+                            audio_tensor_raw = pl_module(text, text_lengths, self.scales, sid=sid).detach().cpu()
+                            _LOGGER.debug(f"Raw audio tensor shape from model: {audio_tensor_raw.shape}")
 
-                            # Scale for better listening volume
+                            # --- ****** FIX FOR 3D TENSOR ****** ---
+                            # Check shape and squeeze if necessary to get (time,) or (channels, time)
+                            if audio_tensor_raw.ndim == 3:
+                                # Most likely case: (batch=1, channels=1, time)
+                                if audio_tensor_raw.shape[0] == 1 and audio_tensor_raw.shape[1] == 1:
+                                    audio_tensor = audio_tensor_raw.squeeze(0).squeeze(0) # Squeeze both -> (time,)
+                                    _LOGGER.debug(f"Squeezed 3D tensor to shape: {audio_tensor.shape}")
+                                # Less likely: (batch=1, channels>1, time)
+                                elif audio_tensor_raw.shape[0] == 1:
+                                     audio_tensor = audio_tensor_raw.squeeze(0) # Squeeze batch -> (channels, time)
+                                     _LOGGER.debug(f"Squeezed 3D tensor (batch dim) to shape: {audio_tensor.shape}")
+                                # Handle other unexpected 3D shapes
+                                else:
+                                     _LOGGER.warning(f"Unexpected 3D audio tensor shape {audio_tensor_raw.shape}. Taking first batch element.")
+                                     audio_tensor = audio_tensor_raw[0] # Now 2D: (channels, time)
+
+                            elif audio_tensor_raw.ndim == 2:
+                                # Expected 2D: (channels, time) or maybe (1, time)
+                                audio_tensor = audio_tensor_raw
+                                _LOGGER.debug(f"Audio tensor already 2D: {audio_tensor.shape}")
+                            elif audio_tensor_raw.ndim == 1:
+                                # Expected 1D: (time,)
+                                audio_tensor = audio_tensor_raw
+                                _LOGGER.debug(f"Audio tensor already 1D: {audio_tensor.shape}")
+                            else:
+                                _LOGGER.warning(f"Audio tensor has unexpected dimension {audio_tensor_raw.ndim}. Skipping sample.")
+                                continue # Skip this sample
+                            # --- ****** END FIX ****** ---
+
+
+                            # --- Scale audio ---
                             max_amp = torch.max(torch.abs(audio_tensor))
                             if max_amp > 1e-4:
                                 audio_tensor = audio_tensor * (0.95 / max_amp)
@@ -386,14 +436,21 @@ class AudioSampleLogger(Callback):
                             # --- Save the audio file ---
                             output_filename = samples_dir / f"{tag_name}.wav"
                             try:
-                                # Ensure tensor is 2D (channels, time) for torchaudio
+                                # Ensure tensor is 2D (channels, time) for torchaudio.save
                                 if audio_tensor.ndim == 1:
+                                    # Add channel dimension: (time,) -> (1, time)
                                     audio_tensor_save = audio_tensor.unsqueeze(0)
+                                elif audio_tensor.ndim == 2:
+                                    # Assume it's already (channels, time) or (1, time)
+                                    audio_tensor_save = audio_tensor
                                 else:
-                                     audio_tensor_save = audio_tensor # Assume already (1, time) or (channels, time)
+                                    # This case should be prevented by the shape check above, but check again for safety
+                                    _LOGGER.warning(f"Cannot save audio tensor with dimension {audio_tensor.ndim} for sample {output_filename}.")
+                                    continue
 
+                                _LOGGER.debug(f"Saving audio sample {output_filename} with shape: {audio_tensor_save.shape}")
                                 torchaudio.save(
-                                    str(output_filename), # Path needs to be string
+                                    str(output_filename),
                                     audio_tensor_save,
                                     sample_rate
                                 )
@@ -401,15 +458,25 @@ class AudioSampleLogger(Callback):
                             except Exception as e_save:
                                 _LOGGER.error(f"Failed to save audio sample {output_filename}: {e_save}")
 
-                            # --- Log to TensorBoard (if available) ---
+                            # --- Log to TensorBoard ---
                             if logger_available:
                                 try:
-                                    # Ensure tensor is 2D (1, num_samples) for add_audio
+                                    # Ensure tensor is 2D (1, time) for logger.experiment.add_audio
                                     if audio_tensor.ndim == 1:
-                                        audio_tensor_log = audio_tensor.unsqueeze(0)
+                                         audio_tensor_log = audio_tensor.unsqueeze(0) # (time,) -> (1, time)
+                                    elif audio_tensor.ndim == 2:
+                                         # If it's (channels>1, time), take the first channel
+                                         if audio_tensor.shape[0] > 1:
+                                             _LOGGER.debug(f"Logging first channel of multi-channel audio {tag_name}")
+                                             audio_tensor_log = audio_tensor[0, :].unsqueeze(0) # (channels, time) -> (1, time)
+                                         else:
+                                             # Already (1, time)
+                                             audio_tensor_log = audio_tensor
                                     else:
-                                        audio_tensor_log = audio_tensor
+                                        _LOGGER.warning(f"Cannot log audio tensor with dimension {audio_tensor.ndim} for sample {tag_name}.")
+                                        continue
 
+                                    _LOGGER.debug(f"Logging audio sample {tag_name} with shape: {audio_tensor_log.shape}")
                                     trainer.logger.experiment.add_audio(
                                         tag_name,
                                         audio_tensor_log,
@@ -420,7 +487,6 @@ class AudioSampleLogger(Callback):
                                 except Exception as e_log:
                                      _LOGGER.error(f"Failed to log audio sample {tag_name} to logger: {e_log}")
 
-
                         except Exception as e_inner:
                             _LOGGER.error(f"Error generating/processing sample {i} (index {idx}) at step {step + 1}: {e_inner}", exc_info=True)
 
@@ -428,7 +494,6 @@ class AudioSampleLogger(Callback):
                  _LOGGER.error(f"Error during audio sample generation outer loop at step {step + 1}: {e_outer}", exc_info=True)
             finally:
                 pl_module.train() # Ensure model is back in train mode
-                # pl_module.to(original_device) # Move back if needed (usually not required)
                 
 def main():
     logging.basicConfig(level=logging.DEBUG)
@@ -503,8 +568,7 @@ def main():
     )
     parser.add_argument(
         "--smart_init",
-        type=bool,
-        default=False,
+        action="store_true",
         help="Use Steve's smart initializing or Pytorch"
     )
     parser.add_argument(
