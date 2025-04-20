@@ -41,6 +41,7 @@ WORLD_SIZE=4 python3 -m piper_train --dataset-dir /data/piper/steve_combined_mul
 **Future Contributions:**
 
 Stay tuned! We are actively training a new model using viPiper's capabilities and look forward to sharing it soon.
+Contaxt us for contribution or commercial implementation at nguyen@hatto.com
 
 **License:**
 
@@ -54,7 +55,7 @@ To cite viPiper in your publications:
 
 ```bibtex
 @misc{viPiper_EraX_2025,
-  author       = {Steve Nguyen Anh Nguyen nguyen@hatto.com},
+  author       = {Steve Nguyen Anh Nguyen},
   title        = {viPiper: Enhanced TTS Training, Pruning, and Vietnamese Voice Synthesis},
   year         = {2024},
   publisher    = {GitHub},
