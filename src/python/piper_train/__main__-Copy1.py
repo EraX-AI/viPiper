@@ -2,16 +2,12 @@ import argparse
 import json
 import logging
 import math
-import os
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
-from pytorch_lightning.callbacks import RichProgressBar
-from pytorch_lightning.callbacks import ProgressBarBase
-import sys
+from pytorch_lightning.callbacks import ModelCheckpoint
 
 from .vits.lightning import VitsModel
 
@@ -109,6 +105,47 @@ def init_weights_vits(model):
     _LOGGER.info("VITS model weights initialized for training from scratch")
     return model
 
+'''
+My weight initialization strategy for the VITS model in Piper is designed to be optimal for text-to-speech synthesis. Here's the approach I implemented:
+
+For different components of the VITS architecture, I use specific initialization methods:
+
+1. **Text and Posterior Encoders**:
+   - Xavier/Glorot normal initialization (gain=1.0) for linear layers
+   - This helps maintain proper signal variance through the encoder's transformer layers
+
+2. **Decoder and Upsampling Components**:
+   - Xavier uniform for convolutional and transposed convolutional layers
+   - Reduced gain (0.5) specifically for upsampling layers to prevent activation explosion
+   - Standard gain (1.0) for other decoder components
+
+3. **WaveNet and ResBlock Components**:
+   - Kaiming normal initialization for convolutional layers
+   - This is optimized for ReLU activations commonly used in these components
+   - Mode set to 'fan_in' to preserve variance in the forward pass
+
+4. **Embedding Layers**:
+   - Normal distribution (mean=0.0, std=0.02)
+   - This standard approach for embeddings works well in TTS systems
+
+5. **Normalization Layers**:
+   - Weight=1.0, bias=0.0 for all normalization components
+   - This initializes them as identity functions to start
+
+6. **Other Convolutional Layers**:
+   - Scale-based uniform initialization based on input dimensions and kernel size
+   - Fallback to Xavier uniform when appropriate
+
+This comprehensive approach provides a good starting point for training a VITS model from scratch, with each component initialized according to its specific role in the network, following best practices from TTS research.
+'''
+
+import torch
+import torch.nn as nn
+import math
+import logging
+
+# Assume _LOGGER is already defined as in your script
+# _LOGGER = logging.getLogger(__package__) # Or appropriate logger setup
 
 def init_weights_pytorch_default(model):
     """Initialize model weights using PyTorch's default initialization methods.
@@ -249,10 +286,15 @@ def load_state_dict_flexible(model, saved_state_dict):
     _LOGGER.info(f"Loaded state dict: {matched_keys} matched keys, {missing_keys} missing keys, {size_mismatch} size mismatches")
     model.load_state_dict(new_state_dict)
 
+import torch
+import torchaudio # Make sure this is imported at the top of the file if not already
+from pathlib import Path
+import random
+import logging # Ensure logging is imported
 from pytorch_lightning.callbacks import Callback
 import pytorch_lightning as pl
-import torchaudio
-import random
+
+_LOGGER = logging.getLogger(__package__) # Ensure logger is defined
 
 class AudioSampleLogger(Callback):
     """
@@ -452,20 +494,6 @@ class AudioSampleLogger(Callback):
                  _LOGGER.error(f"Error during audio sample generation outer loop at step {step + 1}: {e_outer}", exc_info=True)
             finally:
                 pl_module.train() # Ensure model is back in train mode
-
-class LitProgressBar(ProgressBarBase):
-    def __init__(self):
-        super().__init__()
-        self.enable = True
-    
-    def disable(self):
-        self.enable = False
-    
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=None):
-        super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
-        percent = (self.train_batch_idx / self.total_train_batches) * 100
-        sys.stdout.flush()
-        sys.stdout.write(f'{percent:.01f} percent complete \r')
                 
 def main():
     logging.basicConfig(level=logging.DEBUG)
@@ -561,13 +589,6 @@ def main():
         default=8,
         help="Number of workers for DataLoader"
     )
-    # New arguments for better resume functionality
-    parser.add_argument(
-        "--auto_resume",
-        action="store_true",
-        help="Automatically resume from the most recent checkpoint in the checkpoints directory"
-    )
-    
     Trainer.add_argparse_args(parser)
     VitsModel.add_model_specific_args(parser)
     parser.add_argument("--seed", type=int, default=1234)
@@ -604,74 +625,60 @@ def main():
             optimization_info = config["optimization"]
             _LOGGER.info(f"Found optimization info: {optimization_info}")
 
-    # Set up callbacks
-    callbacks = []
+    # Add Lit ProgressBar
+    from pytorch_lightning.callbacks import ProgressBarBase
+    import sys
     
-    # Add LR Monitor to track scheduler behavior
-    lr_monitor = LearningRateMonitor(logging_interval='step')
-    callbacks.append(lr_monitor)
+    class LitProgressBar(ProgressBarBase):
+        def __init__(self):
+            super().__init__()  # don't forget this :)
+            self.enable = True
+        
+        def disable(self):
+            self.enable = False
+        
+        def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, unused=None):
+            super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)  # don't forget this :)
+            percent = (self.train_batch_idx / self.total_train_batches) * 100
+            sys.stdout.flush()
+            sys.stdout.write(f'{percent:.01f} percent complete \r')
     
-    # Add progress bars
     bar = LitProgressBar()
-    callbacks.append(bar)
-    
-    # RichProgressBar for prettier display
-    if not any(isinstance(cb, RichProgressBar) for cb in callbacks):
-        callbacks.append(RichProgressBar())
-    
-    # Configure checkpoint saving (critical for proper state preservation)
+
+    from pytorch_lightning.callbacks import RichProgressBar
+
+    trainer = Trainer.from_argparse_args(args)
     checkpoint_callback = None
     if args.checkpoint_epochs is not None:
+        # Configure ModelCheckpoint to save top 50 based on val_loss
+        # and name files uniquely by epoch and loss.
         checkpoint_callback = ModelCheckpoint(
             dirpath=Path(args.weights_save_path) if args.weights_save_path else Path(args.default_root_dir) / "checkpoints",
-            filename='piper-{epoch:03d}-{val_loss:.2f}',  # Unique names
+            filename='piper-{epoch:03d}-{val_loss:.2f}', # Unique names
             monitor='val_loss',             # Metric to monitor
             mode='min',                     # Minimize validation loss
-            save_top_k=args.max_epoch_keeps, # Keep top N checkpoints
+            save_top_k=args.max_epoch_keeps, #Keep top max_epoch_keeps checkpoints
             every_n_epochs=args.checkpoint_epochs, # Save frequency
-            save_last=True,                # Also save the very last one
-            save_weights_only=False        # This is critical: save optimizer state too
+            save_last=True               # Also save the very last one
         )
-        callbacks.append(checkpoint_callback)
-        _LOGGER.info(
-            f"Checkpoints will be saved every {args.checkpoint_epochs} epoch(s), "
-            f"keeping top {args.max_epoch_keeps} based on val_loss"
+        trainer.callbacks.append(checkpoint_callback) # Append instead of overwriting
+        _LOGGER.debug(
+            "Checkpoints will be saved every %s epoch(s), keeping top 50 based on val_loss", args.checkpoint_epochs
         )
-    
-    # Add audio sample logger
+        # Ensure RichProgressBar is also added if not already present by default from Trainer args
+        if not any(isinstance(cb, RichProgressBar) for cb in trainer.callbacks):
+             trainer.callbacks.append(RichProgressBar())
+    else:
+        # Add progress bar even if checkpointing is disabled
+        if not any(isinstance(cb, RichProgressBar) for cb in trainer.callbacks):
+             trainer.callbacks.append(RichProgressBar())
+
     audio_logger_callback = AudioSampleLogger(frequency=args.sample_steps, num_samples=2)
-    callbacks.append(audio_logger_callback)
+    trainer.callbacks.append(audio_logger_callback)
     
-    # Determine if we should resume from a checkpoint
-    resume_checkpoint_path = None
-    
-    # Check for explicit resume path
-    if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
-        resume_checkpoint_path = args.resume_checkpoint
-        _LOGGER.info(f"Will resume from specified checkpoint: {resume_checkpoint_path}")
-    
-    # Check for auto-resume from last.ckpt
-    elif args.auto_resume:
-        last_checkpoint_path = Path(args.default_root_dir) / "checkpoints" / "last.ckpt"
-        if last_checkpoint_path.exists():
-            resume_checkpoint_path = str(last_checkpoint_path)
-            _LOGGER.info(f"Auto-resuming from checkpoint: {resume_checkpoint_path}")
-        else:
-            _LOGGER.info("No checkpoint found for auto-resume. Will start fresh training.")
-    
-    # Create trainer with appropriate settings for resuming
-    trainer_kwargs = vars(args)
-    trainer_kwargs['callbacks'] = callbacks
-    
-    # Add resume_from_checkpoint if needed
-    if resume_checkpoint_path:
-        trainer_kwargs['resume_from_checkpoint'] = resume_checkpoint_path
-    
-    trainer = Trainer(**trainer_kwargs)
-    
-    # Initialize model arguments
     dict_args = vars(args)
     
+                
     # Set model architecture based on quality            
     if args.quality == "x-low":
         dict_args["hidden_channels"] = 96
@@ -786,106 +793,166 @@ def main():
     _LOGGER.info(f"  - n_layers: {model.model_g.n_layers}")
     _LOGGER.info(f"  - filter_channels: {model.model_g.filter_channels}")
     
-    # Skip weight loading if we're resuming from a checkpoint (Lightning will handle this)
-    if resume_checkpoint_path is None:
-        # If from_scratch is specified, initialize weights and skip loading checkpoints
-        if args.from_scratch:
-            if args.smart_init:
-                _LOGGER.info("Training from scratch with STEVE's VITS weight initialization")
-                model = init_weights_vits(model)
-            else:
-                _LOGGER.info("Training from scratch with PyTorch's VITS weight initialization")
-                model = init_weights_pytorch_default(model)
+    # If from_scratch is specified, initialize weights and skip loading checkpoints
+    if args.from_scratch: # and args.quality == "optimized":
+        if args.smart_init:
+            _LOGGER.info("Training from scratch with STEVE's VITS weight initialization")
+            model = init_weights_vits(model)
+        else:
+            _LOGGER.info("Training from scratch with PyTorch's VITS weight initialization")
+            model = init_weights_pytorch_default(model)
 
-            _LOGGER.info("Model initialized with random weights for from-scratch training")
+        _LOGGER.info("Model initialized with random weights for from-scratch training")
+    
+    # Handle loading from optimized model dir (only if not training from scratch)
+    elif args.optimized_model_dir:
+        model_path = Path(args.optimized_model_dir) / "model.pt"
+        if not model_path.exists():
+            model_path = Path(args.optimized_model_dir) / "model.ckpt"
         
-        # Handle loading from optimized model dir (only if not training from scratch)
-        elif args.optimized_model_dir:
-            model_path = Path(args.optimized_model_dir) / "model.pt"
-            if not model_path.exists():
-                model_path = Path(args.optimized_model_dir) / "model.ckpt"
-            
-            if model_path.exists():
-                _LOGGER.info(f"Loading optimized model from {model_path}")
-                try:
-                    # Load optimized model
-                    checkpoint = torch.load(model_path, map_location='cpu')
+        if model_path.exists():
+            _LOGGER.info(f"Loading optimized model from {model_path}")
+            try:
+                # Load optimized model
+                checkpoint = torch.load(model_path, map_location='cpu')
+                
+                if isinstance(checkpoint, dict) and 'model' in checkpoint:
+                    state_dict = checkpoint['model']
                     
-                    if isinstance(checkpoint, dict) and 'model' in checkpoint:
+                    # Extract generator and discriminator weights
+                    model_g_dict = {k.replace('model_g.', ''): v for k, v in state_dict.items() 
+                                  if isinstance(k, str) and (k.startswith('model_g.') or not '.' in k)}
+                    
+                    model_d_dict = {k.replace('model_d.', ''): v for k, v in state_dict.items() 
+                                  if isinstance(k, str) and k.startswith('model_d.')}
+                    
+                    # If we didn't find properly prefixed weights, try finding them directly
+                    if not model_g_dict and not model_d_dict:
+                        # Try to infer which keys belong to which model
+                        model_g_dict = {}
+                        model_d_dict = {}
+                        
+                        for k, v in state_dict.items():
+                            if not isinstance(k, str):
+                                continue
+                            if any(x in k for x in ['enc_', 'dec.', 'flow.', 'dp.']):
+                                model_g_dict[k] = v
+                            elif any(x in k for x in ['disc', 'mpd.', 'msd.', 'discriminator']):
+                                model_d_dict[k] = v
+                    
+                    # Report weight stats
+                    _LOGGER.info(f"Found {len(model_g_dict)} generator weights and {len(model_d_dict)} discriminator weights")
+                    
+                    # Load weights with improved flexibility
+                    if model_g_dict:
+                        load_state_dict_flexible(model.model_g, model_g_dict)
+                    if model_d_dict:
+                        load_state_dict_flexible(model.model_d, model_d_dict)
+                    
+                    _LOGGER.info("Successfully loaded weights from optimized model")
+                else:
+                    _LOGGER.error("Invalid model format in optimized model directory")
+            except Exception as e:
+                _LOGGER.error(f"Error loading optimized model: {e}")
+                import traceback
+                traceback.print_exc()
+
+    # Handle loading from optimized (or not) checkpoint (only if not training from scratch)
+    elif args.resume_checkpoint and args.quality == "optimized":
+            _LOGGER.info(f"Loading optimized checkpoint: {args.resume_checkpoint}")
+            try:
+                # Try to load checkpoint
+                checkpoint = torch.load(args.resume_checkpoint, map_location='cpu')
+                
+                # Determine source of model weights
+                if isinstance(checkpoint, dict):
+                    if 'model' in checkpoint and isinstance(checkpoint['model'], dict):
+                        # Direct Piper format
                         state_dict = checkpoint['model']
-                        
-                        # Extract generator and discriminator weights
-                        model_g_dict = {k.replace('model_g.', ''): v for k, v in state_dict.items() 
-                                      if isinstance(k, str) and (k.startswith('model_g.') or not '.' in k)}
-                        
-                        model_d_dict = {k.replace('model_d.', ''): v for k, v in state_dict.items() 
-                                      if isinstance(k, str) and k.startswith('model_d.')}
-                        
-                        # If we didn't find properly prefixed weights, try finding them directly
-                        if not model_g_dict and not model_d_dict:
-                            # Try to infer which keys belong to which model
-                            model_g_dict = {}
-                            model_d_dict = {}
-                            
-                            for k, v in state_dict.items():
-                                if not isinstance(k, str):
-                                    continue
-                                if any(x in k for x in ['enc_', 'dec.', 'flow.', 'dp.']):
-                                    model_g_dict[k] = v
-                                elif any(x in k for x in ['disc', 'mpd.', 'msd.', 'discriminator']):
-                                    model_d_dict[k] = v
-                        
-                        # Report weight stats
-                        _LOGGER.info(f"Found {len(model_g_dict)} generator weights and {len(model_d_dict)} discriminator weights")
-                        
-                        # Load weights with improved flexibility
-                        if model_g_dict:
-                            load_state_dict_flexible(model.model_g, model_g_dict)
-                        if model_d_dict:
-                            load_state_dict_flexible(model.model_d, model_d_dict)
-                        
-                        _LOGGER.info("Successfully loaded weights from optimized model")
+                        _LOGGER.debug("Using 'model' key from checkpoint")
+                    elif 'state_dict' in checkpoint:
+                        # Lightning checkpoint format
+                        state_dict = checkpoint['state_dict']
+                        _LOGGER.debug("Using 'state_dict' key from checkpoint")
                     else:
-                        _LOGGER.error("Invalid model format in optimized model directory")
-                except Exception as e:
-                    _LOGGER.error(f"Error loading optimized model: {e}")
-                    import traceback
-                    traceback.print_exc()
+                        # Assume direct state dict
+                        state_dict = checkpoint
+                        _LOGGER.debug("Using checkpoint directly as state dict")
+                else:
+                    _LOGGER.error("Checkpoint is not a dictionary")
+                    raise ValueError("Invalid checkpoint format")
+                    
+                # Extract model_g and model_d weights
+                model_g_dict = {k.replace('model_g.', ''): v for k, v in state_dict.items() 
+                              if isinstance(k, str) and k.startswith('model_g.')}
+                model_d_dict = {k.replace('model_d.', ''): v for k, v in state_dict.items() 
+                              if isinstance(k, str) and k.startswith('model_d.')}
+                
+                # If we didn't find properly prefixed weights, try finding them directly
+                if not model_g_dict and not model_d_dict:
+                    _LOGGER.warning("Could not find prefixed weights, trying direct detection")
+                    # Try to infer which keys belong to which model
+                    model_g_dict = {}
+                    model_d_dict = {}
+                    
+                    for k, v in state_dict.items():
+                        if not isinstance(k, str):
+                            continue
+                        if any(x in k for x in ['enc_', 'dec.', 'flow.', 'dp.']):
+                            model_g_dict[k] = v
+                        elif any(x in k for x in ['disc', 'mpd.', 'msd.', 'discriminator']):
+                            model_d_dict[k] = v
+                
+                # Report weight stats
+                _LOGGER.info(f"Found {len(model_g_dict)} generator weights and {len(model_d_dict)} discriminator weights")
+                
+                # Load weights with improved handling for optimized models
+                if model_g_dict:
+                    load_state_dict_flexible(model.model_g, model_g_dict)
+                if model_d_dict:
+                    load_state_dict_flexible(model.model_g, model_g_dict)
+                    
+                _LOGGER.info("Successfully loaded weights from optimized model")
+                
+            except Exception as e:
+                _LOGGER.error(f"Failed to load checkpoint: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
 
-        # Handle loading from single-speaker checkpoint (only if not training from scratch)
-        elif args.resume_from_single_speaker_checkpoint:
-            assert (
-                num_speakers > 1
-            ), "--resume_from_single_speaker_checkpoint is only for multi-speaker models. Use --resume_checkpoint for single-speaker models."
+    # Handle loading from single-speaker checkpoint (only if not training from scratch)
+    elif args.resume_from_single_speaker_checkpoint:
+        assert (
+            num_speakers > 1
+        ), "--resume_from_single_speaker_checkpoint is only for multi-speaker models. Use --resume_from_checkpoint for single-speaker models."
 
-            # Load single-speaker checkpoint
-            _LOGGER.debug(
-                "Resuming from single-speaker checkpoint: %s",
-                args.resume_from_single_speaker_checkpoint,
-            )
-            model_single = VitsModel.load_from_checkpoint(
-                args.resume_from_single_speaker_checkpoint,
-                dataset=None,
-            )
-            g_dict = model_single.model_g.state_dict()
-            for key in list(g_dict.keys()):
-                # Remove keys that can't be copied over due to missing speaker embedding
-                if (
-                    key.startswith("dec.cond")
-                    or key.startswith("dp.cond")
-                    or ("enc.cond_layer" in key)
-                ):
-                    g_dict.pop(key, None)
+        # Load single-speaker checkpoint
+        _LOGGER.debug(
+            "Resuming from single-speaker checkpoint: %s",
+            args.resume_from_single_speaker_checkpoint,
+        )
+        model_single = VitsModel.load_from_checkpoint(
+            args.resume_from_single_speaker_checkpoint,
+            dataset=None,
+        )
+        g_dict = model_single.model_g.state_dict()
+        for key in list(g_dict.keys()):
+            # Remove keys that can't be copied over due to missing speaker embedding
+            if (
+                key.startswith("dec.cond")
+                or key.startswith("dp.cond")
+                or ("enc.cond_layer" in key)
+            ):
+                g_dict.pop(key, None)
 
-            # Copy over the multi-speaker model, excluding keys related to the
-            # speaker embedding (which is missing from the single-speaker model).
-            load_state_dict(model.model_g, g_dict)
-            load_state_dict(model.model_d, model_single.model_d.state_dict())
-            _LOGGER.info(
-                "Successfully converted single-speaker checkpoint to multi-speaker"
-            )
+        # Copy over the multi-speaker model, excluding keys related to the
+        # speaker embedding (which is missing from the single-speaker model).
+        load_state_dict(model.model_g, g_dict)
+        load_state_dict(model.model_d, model_single.model_d.state_dict())
+        _LOGGER.info(
+            "Successfully converted single-speaker checkpoint to multi-speaker"
+        )
 
-    # Start training with properly configured trainer
     trainer.fit(model)
 
 
