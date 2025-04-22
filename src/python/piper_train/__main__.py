@@ -573,7 +573,24 @@ def main():
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
     _LOGGER.debug(args)
-
+    
+    # Determine if we should resume from a checkpoint
+    resume_checkpoint_path = None
+    
+    # Check for explicit resume path
+    if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
+        resume_checkpoint_path = args.resume_checkpoint
+        _LOGGER.info(f"Will resume from specified checkpoint: {resume_checkpoint_path}")
+    
+    # Check for auto-resume from last.ckpt
+    elif args.auto_resume:
+        last_checkpoint_path = Path(args.default_root_dir) / "checkpoints" / "last.ckpt"
+        if last_checkpoint_path.exists():
+            resume_checkpoint_path = str(last_checkpoint_path)
+            _LOGGER.info(f"Auto-resuming from checkpoint: {resume_checkpoint_path}")
+        else:
+            _LOGGER.info("No checkpoint found for auto-resume. Will start fresh training.")
+            
     args.dataset_dir = Path(args.dataset_dir)
     if not args.default_root_dir:
         args.default_root_dir = args.dataset_dir
