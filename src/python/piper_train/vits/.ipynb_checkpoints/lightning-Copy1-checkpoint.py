@@ -122,9 +122,6 @@ class VitsModel(pl.LightningModule):
         # State kept between training optimizers
         self._y = None
         self._y_hat = None
-        self._loaded_global_step = 0
-        self._loaded_epoch = 0
-
 
     def _load_datasets(
         self,
@@ -394,11 +391,6 @@ class VitsModel(pl.LightningModule):
             
             # Define cosine schedule with warmup
             def lr_lambda(current_step):
-                # Add this block to account for resuming
-                if hasattr(self, '_loaded_global_step'):
-                    # Adjust step to account for resuming
-                    current_step += self._loaded_global_step
-                
                 if current_step < warmup_steps:
                     # Linear warmup
                     return float(current_step) / float(max(1, warmup_steps))
@@ -407,7 +399,7 @@ class VitsModel(pl.LightningModule):
                 progress = float(current_step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
                 cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
                 return max(0.05, cosine_decay)  # Don't go below 5% of max lr
-                
+            
             schedulers = [
                 {
                     "scheduler": LambdaLR(optimizers[0], lr_lambda),
@@ -425,24 +417,7 @@ class VitsModel(pl.LightningModule):
                 }
             ]        
         return optimizers, schedulers
-
-    def on_save_checkpoint(self, checkpoint):
-        """Store metadata about training progress for proper resuming"""
-        checkpoint['vits_metadata'] = {
-            'epoch': self.current_epoch,
-            'global_step': self.global_step,
-        }
-        super().on_save_checkpoint(checkpoint)
     
-    def on_load_checkpoint(self, checkpoint):
-        """Load saved metadata for proper resuming of training"""
-        if 'vits_metadata' in checkpoint:
-            metadata = checkpoint['vits_metadata']
-            self._loaded_epoch = metadata.get('epoch', 0)
-            self._loaded_global_step = metadata.get('global_step', 0)
-            _LOGGER.info(f"Resuming from epoch {self._loaded_epoch}, global step {self._loaded_global_step}")
-        super().on_load_checkpoint(checkpoint)
-        
     @staticmethod
     def add_model_specific_args(parent_parser):
         parser = parent_parser.add_argument_group("VitsModel")

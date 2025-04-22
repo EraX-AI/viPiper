@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple, Union, Dict, Any
+from typing import List, Optional, Tuple, Union
 
 import pytorch_lightning as pl
 import torch
@@ -122,10 +122,9 @@ class VitsModel(pl.LightningModule):
         # State kept between training optimizers
         self._y = None
         self._y_hat = None
-        
-        # For tracking resume data
-        self._loaded_epoch = 0
         self._loaded_global_step = 0
+        self._loaded_epoch = 0
+
 
     def _load_datasets(
         self,
@@ -197,14 +196,10 @@ class VitsModel(pl.LightningModule):
 
     def training_step(self, batch: Batch, batch_idx: int, optimizer_idx: int):
         if optimizer_idx == 0:
-            loss_g = self.training_step_g(batch)
-            self.log("loss_gen_all", loss_g, prog_bar=True, on_step=True, sync_dist=True)
-            return loss_g
+            return self.training_step_g(batch)
 
         if optimizer_idx == 1:
-            loss_d = self.training_step_d(batch)
-            self.log("loss_disc_all", loss_d, prog_bar=True, on_step=True, sync_dist=True)
-            return loss_d
+            return self.training_step_d(batch)
 
     def training_step_g(self, batch: Batch):
         x, x_lengths, y, _, spec, spec_lengths, speaker_ids = (
@@ -271,14 +266,7 @@ class VitsModel(pl.LightningModule):
             loss_gen, _losses_gen = generator_loss(y_d_hat_g)
             loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
 
-            # Log detailed losses for analysis
-            self.log_dict({
-                "g/loss_dur": loss_dur,
-                "g/loss_mel": loss_mel,
-                "g/loss_kl": loss_kl,
-                "g/loss_fm": loss_fm,
-                "g/loss_gen": loss_gen,
-            }, prog_bar=False, on_step=True)
+            self.log("loss_gen_all", loss_gen_all)
 
             return loss_gen_all
 
@@ -290,131 +278,125 @@ class VitsModel(pl.LightningModule):
 
         with autocast(self.device.type, enabled=False):
             # Discriminator
-            loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
+            loss_disc, _losses_disc_r, _losses_disc_g = discriminator_loss(
                 y_d_hat_r, y_d_hat_g
             )
             loss_disc_all = loss_disc
-            
-            # Log discriminator detailed losses
-            self.log_dict({
-                "d/loss_disc": loss_disc,
-                "d/loss_disc_r": torch.mean(torch.stack(losses_disc_r)),
-                "d/loss_disc_g": torch.mean(torch.stack(losses_disc_g))
-            }, prog_bar=False, on_step=True)
+
+            self.log("loss_disc_all", loss_disc_all)
 
             return loss_disc_all
 
     def validation_step(self, batch: Batch, batch_idx: int):
-        # Calculate validation losses
-        val_loss_g = self.training_step_g(batch)
-        val_loss_d = self.training_step_d(batch)
-        val_loss = val_loss_g + val_loss_d
-        
-        # Log validation metrics
-        self.log_dict({
-            "val/loss_g": val_loss_g,
-            "val/loss_d": val_loss_d,
-            "val_loss": val_loss  # This is monitored by ModelCheckpoint
-        }, prog_bar=True, sync_dist=True)
+        val_loss = self.training_step_g(batch) + self.training_step_d(batch)
+        self.log("val_loss", val_loss)
 
-        # Generate audio examples only on the first batch and global rank 0
-        if batch_idx == 0 and self.global_rank == 0:
-            for utt_idx, test_utt in enumerate(self._test_dataset):
-                if utt_idx >= 2:  # Limit to 2 examples
-                    break
-                    
-                text = test_utt.phoneme_ids.unsqueeze(0).to(self.device)
-                text_lengths = torch.LongTensor([len(test_utt.phoneme_ids)]).to(self.device)
-                scales = [0.667, 1.0, 0.8]
-                sid = (
-                    test_utt.speaker_id.to(self.device)
-                    if test_utt.speaker_id is not None
-                    else None
-                )
-                test_audio = self(text, text_lengths, scales, sid=sid).detach()
+        # Generate audio examples
+        for utt_idx, test_utt in enumerate(self._test_dataset):
+            text = test_utt.phoneme_ids.unsqueeze(0).to(self.device)
+            text_lengths = torch.LongTensor([len(test_utt.phoneme_ids)]).to(self.device)
+            scales = [0.667, 1.0, 0.8]
+            sid = (
+                test_utt.speaker_id.to(self.device)
+                if test_utt.speaker_id is not None
+                else None
+            )
+            test_audio = self(text, text_lengths, scales, sid=sid).detach()
 
-                # Scale to make louder in [-1, 1]
-                test_audio = test_audio * (1.0 / max(0.01, abs(test_audio.max())))
+            # Scale to make louder in [-1, 1]
+            test_audio = test_audio * (1.0 / max(0.01, abs(test_audio.max())))
 
-                tag = test_utt.text or str(utt_idx)
-                
-                # Log with correct shape for TensorBoard
-                audio_tensor = test_audio
-                if audio_tensor.ndim > 1:
-                    if audio_tensor.shape[0] == 1:
-                        audio_tensor = audio_tensor.squeeze(0)
-                
-                self.logger.experiment.add_audio(
-                    f"val_audio/{tag}", 
-                    audio_tensor,
-                    global_step=self.global_step,
-                    sample_rate=self.hparams.sample_rate
-                )
+            tag = test_utt.text or str(utt_idx)
+            self.logger.experiment.add_audio(
+                tag, test_audio, sample_rate=self.hparams.sample_rate
+            )
 
         return val_loss
+    '''
+    def configure_optimizers(self):
+        optimizers = [
+            torch.optim.AdamW(
+                self.model_g.parameters(),
+                lr=self.hparams.learning_rate,
+                betas=self.hparams.betas,
+                eps=self.hparams.eps,
+            ),
+            torch.optim.AdamW(
+                self.model_d.parameters(),
+                lr=self.hparams.learning_rate,
+                betas=self.hparams.betas,
+                eps=self.hparams.eps,
+            ),
+        ]
+        schedulers = [
+            torch.optim.lr_scheduler.ExponentialLR(
+                optimizers[0], gamma=self.hparams.lr_decay
+            ),
+            torch.optim.lr_scheduler.ExponentialLR(
+                optimizers[1], gamma=self.hparams.lr_decay
+            ),
+        ]
 
+        return optimizers, schedulers
+    '''
     def configure_optimizers(self):
         """
-        Sets up optimizer and learning rate scheduler with state preservation for proper resuming.
+        Sets up optimizer and learning rate scheduler with cosine annealing and warmup.
         """
         import math
-        from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, ExponentialLR
-        
-        # Create optimizers for generator and discriminator
-        optimizer_g = torch.optim.AdamW(
-            self.model_g.parameters(),
-            lr=self.hparams.learning_rate,
-            betas=self.hparams.betas,
-            eps=self.hparams.eps,
-            weight_decay=self.hparams.weight_decay,
-        )
-        
-        optimizer_d = torch.optim.AdamW(
-            self.model_d.parameters(),
-            lr=self.hparams.learning_rate,
-            betas=self.hparams.betas,
-            eps=self.hparams.eps,
-            weight_decay=self.hparams.weight_decay,
-        )
-        
-        # Setup the appropriate scheduler based on configuration
+        from torch.optim.lr_scheduler import LambdaLR
+
         if not self.hparams.cosine_scheduler:
-            # Standard exponential decay scheduler
-            scheduler_g = ExponentialLR(optimizer_g, gamma=self.hparams.lr_decay)
-            scheduler_d = ExponentialLR(optimizer_d, gamma=self.hparams.lr_decay)
-            
-            scheduler_config_g = {
-                "scheduler": scheduler_g,
-                "interval": "step",
-                "frequency": 1,
-                "name": "generator_exp_decay",
-                "monitor": "val_loss"
-            }
-            
-            scheduler_config_d = {
-                "scheduler": scheduler_d,
-                "interval": "step",
-                "frequency": 1,
-                "name": "discriminator_exp_decay",
-                "monitor": "val_loss"
-            }
+            optimizers = [
+                torch.optim.AdamW(
+                    self.model_g.parameters(),
+                    lr=self.hparams.learning_rate,
+                    betas=self.hparams.betas,
+                    eps=self.hparams.eps,
+                ),
+                torch.optim.AdamW(
+                    self.model_d.parameters(),
+                    lr=self.hparams.learning_rate,
+                    betas=self.hparams.betas,
+                    eps=self.hparams.eps,
+                ),
+            ]
+            schedulers = [
+                torch.optim.lr_scheduler.ExponentialLR(
+                    optimizers[0], gamma=self.hparams.lr_decay
+                ),
+                torch.optim.lr_scheduler.ExponentialLR(
+                    optimizers[1], gamma=self.hparams.lr_decay
+                ),
+            ]
         else:
-            # Calculate training steps for cosine scheduler
-            steps_per_epoch = len(self.train_dataloader()) if self.train_dataloader() is not None else 100
-            max_epochs = self.trainer.max_epochs if hasattr(self.trainer, 'max_epochs') else 1000
-            num_training_steps = steps_per_epoch * max_epochs
-            warmup_steps = int(self.hparams.warmup_ratio * num_training_steps)
+            optimizers = [
+                torch.optim.AdamW(
+                    self.model_g.parameters(),
+                    lr=self.hparams.learning_rate,
+                    betas=self.hparams.betas,
+                    eps=self.hparams.eps,
+                    weight_decay=self.hparams.weight_decay,
+                ),
+                torch.optim.AdamW(
+                    self.model_d.parameters(),
+                    lr=self.hparams.learning_rate,
+                    betas=self.hparams.betas,
+                    eps=self.hparams.eps,
+                    weight_decay=self.hparams.weight_decay,
+                ),
+            ]
             
-            # Log scheduler setup information
-            _LOGGER.info(f"Cosine scheduler: steps_per_epoch={steps_per_epoch}, "
-                        f"max_epochs={max_epochs}, "
-                        f"warmup_steps={warmup_steps}, "
-                        f"total_steps={num_training_steps}")
+            # Calculate training steps
+            steps_per_epoch = len(self.train_dataloader())
+            num_training_steps = steps_per_epoch * self.trainer.max_epochs
+            warmup_steps = int(self.hparams.warmup_ratio * num_training_steps)  # xx% of steps for warmup
             
-            # Define lambda function for warmup + cosine decay
+            # Define cosine schedule with warmup
             def lr_lambda(current_step):
-                # Account for resuming by adding the loaded global step
+                # Add this block to account for resuming
                 if hasattr(self, '_loaded_global_step'):
+                    # Adjust step to account for resuming
                     current_step += self._loaded_global_step
                 
                 if current_step < warmup_steps:
@@ -425,90 +407,42 @@ class VitsModel(pl.LightningModule):
                 progress = float(current_step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
                 cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
                 return max(0.05, cosine_decay)  # Don't go below 5% of max lr
-            
-            scheduler_g = LambdaLR(optimizer_g, lr_lambda)
-            scheduler_d = LambdaLR(optimizer_d, lr_lambda)
-            
-            scheduler_config_g = {
-                "scheduler": scheduler_g,
-                "interval": "step",
-                "frequency": 1,
-                "name": "generator_cosine_warmup",
-                "monitor": "val_loss"
-            }
-            
-            scheduler_config_d = {
-                "scheduler": scheduler_d,
-                "interval": "step", 
-                "frequency": 1,
-                "name": "discriminator_cosine_warmup",
-                "monitor": "val_loss"
-            }
-        
-        # Return optimizers and schedulers with complete config
-        return (
-            [optimizer_g, optimizer_d],
-            [scheduler_config_g, scheduler_config_d]
-        )
-    
-    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """
-        Add custom metadata to checkpoint to ensure proper resuming.
-        
-        Args:
-            checkpoint: The checkpoint dictionary being saved
-        """
-        # Add custom metadata to keep track of training progress
+                
+            schedulers = [
+                {
+                    "scheduler": LambdaLR(optimizers[0], lr_lambda),
+                    "interval": "step",
+                    "frequency": 1,
+                    "name": "generator_cosine_warmup",
+                    "monitor": "val_loss"  # Add this line
+                },
+                {
+                    "scheduler": LambdaLR(optimizers[1], lr_lambda),
+                    "interval": "step",
+                    "frequency": 1,
+                    "name": "discriminator_cosine_warmup",
+                    "monitor": "val_loss"  # Add this line
+                }
+            ]        
+        return optimizers, schedulers
+
+    def on_save_checkpoint(self, checkpoint):
+        """Store metadata about training progress for proper resuming"""
         checkpoint['vits_metadata'] = {
             'epoch': self.current_epoch,
             'global_step': self.global_step,
-            'optimizer_states_saved': True,
-            'scheduler_states_saved': True,
         }
-        
-        # Let Lightning handle saving full training state
         super().on_save_checkpoint(checkpoint)
     
-    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        """
-        Load custom metadata from checkpoint for proper resuming.
-        
-        Args:
-            checkpoint: The checkpoint dictionary being loaded
-        """
-        # Extract and store metadata for scheduler adjustment
+    def on_load_checkpoint(self, checkpoint):
+        """Load saved metadata for proper resuming of training"""
         if 'vits_metadata' in checkpoint:
             metadata = checkpoint['vits_metadata']
-            
-            if 'global_step' in metadata:
-                self._loaded_global_step = metadata['global_step']
-                _LOGGER.info(f"Resuming from global step: {self._loaded_global_step}")
-            
-            if 'epoch' in metadata:
-                self._loaded_epoch = metadata['epoch']
-                _LOGGER.info(f"Resuming from epoch: {self._loaded_epoch}")
-                
-            _LOGGER.info(f"Checkpoint contains optimizer states: {metadata.get('optimizer_states_saved', False)}")
-            _LOGGER.info(f"Checkpoint contains scheduler states: {metadata.get('scheduler_states_saved', False)}")
-        
-        # Let Lightning handle loading full training state
+            self._loaded_epoch = metadata.get('epoch', 0)
+            self._loaded_global_step = metadata.get('global_step', 0)
+            _LOGGER.info(f"Resuming from epoch {self._loaded_epoch}, global step {self._loaded_global_step}")
         super().on_load_checkpoint(checkpoint)
-    
-    def on_fit_start(self) -> None:
-        """Log information about resuming or starting training"""
-        if hasattr(self, '_loaded_global_step') and self._loaded_global_step > 0:
-            _LOGGER.info(f"Training resumed from step {self._loaded_global_step}, epoch {self._loaded_epoch}")
-            
-            # Log current learning rates
-            optimizers = self.optimizers()
-            if isinstance(optimizers, list) and len(optimizers) >= 2:
-                _LOGGER.info(f"Generator learning rate: {optimizers[0].param_groups[0]['lr']:.6f}")
-                _LOGGER.info(f"Discriminator learning rate: {optimizers[1].param_groups[0]['lr']:.6f}")
-        else:
-            _LOGGER.info("Starting training from scratch")
-            
-        super().on_fit_start()
-    
+        
     @staticmethod
     def add_model_specific_args(parent_parser):
         parser = parent_parser.add_argument_group("VitsModel")
