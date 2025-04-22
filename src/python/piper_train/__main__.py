@@ -606,31 +606,27 @@ def main():
 
     # Set up callbacks
     callbacks = []
-    
+        
     # Add LR Monitor to track scheduler behavior
     lr_monitor = LearningRateMonitor(logging_interval='step')
     callbacks.append(lr_monitor)
     
-    # Add progress bars
-    bar = LitProgressBar()
-    callbacks.append(bar)
-    
-    # RichProgressBar for prettier display
-    if not any(isinstance(cb, RichProgressBar) for cb in callbacks):
-        callbacks.append(RichProgressBar())
+    # Add audio sample logger
+    audio_logger_callback = AudioSampleLogger(frequency=args.sample_steps, num_samples=2)
+    callbacks.append(audio_logger_callback)
     
     # Configure checkpoint saving (critical for proper state preservation)
     checkpoint_callback = None
     if args.checkpoint_epochs is not None:
         checkpoint_callback = ModelCheckpoint(
             dirpath=Path(args.weights_save_path) if args.weights_save_path else Path(args.default_root_dir) / "checkpoints",
-            filename='piper-{epoch:03d}-{val_loss:.2f}',  # Unique names
-            monitor='val_loss',             # Metric to monitor
-            mode='min',                     # Minimize validation loss
-            save_top_k=args.max_epoch_keeps, # Keep top N checkpoints
-            every_n_epochs=args.checkpoint_epochs, # Save frequency
-            save_last=True,                # Also save the very last one
-            save_weights_only=False        # This is critical: save optimizer state too
+            filename='piper-{epoch:03d}-{val_loss:.2f}',
+            monitor='val_loss',
+            mode='min',
+            save_top_k=args.max_epoch_keeps,
+            every_n_epochs=args.checkpoint_epochs,
+            save_last=True,
+            save_weights_only=False
         )
         callbacks.append(checkpoint_callback)
         _LOGGER.info(
@@ -638,37 +634,40 @@ def main():
             f"keeping top {args.max_epoch_keeps} based on val_loss"
         )
     
-    # Add audio sample logger
-    audio_logger_callback = AudioSampleLogger(frequency=args.sample_steps, num_samples=2)
-    callbacks.append(audio_logger_callback)
+    # Add only ONE progress bar - either LitProgressBar or RichProgressBar but not both
+    # Check args to determine if progress bar should be shown
+    if not hasattr(args, 'enable_progress_bar') or args.enable_progress_bar:
+        # Add a single RichProgressBar if progress is enabled
+        callbacks.append(RichProgressBar())
+    else:
+        # No progress bars will be added when explicitly disabled
+        _LOGGER.info("Progress bar disabled by command line argument")
     
-    # Determine if we should resume from a checkpoint
-    resume_checkpoint_path = None
+    # Create trainer with properly filtered arguments
+    lightning_args = [
+        # Standard Lightning Trainer args
+        'accelerator', 'strategy', 'devices', 'num_nodes', 'precision', 'amp_backend',
+        'amp_level', 'enable_checkpointing', 'logger', 'log_every_n_steps',
+        'max_epochs', 'min_epochs', 'max_steps', 'min_steps', 'max_time', 'limit_train_batches',
+        'limit_val_batches', 'limit_test_batches', 'limit_predict_batches', 'fast_dev_run',
+        'overfit_batches', 'val_check_interval', 'check_val_every_n_epoch', 'num_sanity_val_steps',
+        'accumulate_grad_batches', 'gradient_clip_val', 'gradient_clip_algorithm',
+        'deterministic', 'benchmark', 'inference_mode', 'profiler', 'detect_anomaly',
+        'reload_dataloaders_every_n_epochs', 'default_root_dir',
+        'weights_save_path',
+        # Additional args that our custom code uses
+        'auto_lr_find', 'track_grad_norm', 'sync_batchnorm'
+    ]
     
-    # Check for explicit resume path
-    if args.resume_checkpoint and os.path.exists(args.resume_checkpoint):
-        resume_checkpoint_path = args.resume_checkpoint
-        _LOGGER.info(f"Will resume from specified checkpoint: {resume_checkpoint_path}")
-    
-    # Check for auto-resume from last.ckpt
-    elif args.auto_resume:
-        last_checkpoint_path = Path(args.default_root_dir) / "checkpoints" / "last.ckpt"
-        if last_checkpoint_path.exists():
-            resume_checkpoint_path = str(last_checkpoint_path)
-            _LOGGER.info(f"Auto-resuming from checkpoint: {resume_checkpoint_path}")
-        else:
-            _LOGGER.info("No checkpoint found for auto-resume. Will start fresh training.")
-    
-    # Create trainer with appropriate settings for resuming
-    trainer_kwargs = vars(args)
+    trainer_kwargs = {k: v for k, v in vars(args).items() if k in lightning_args}
+    # Remove enable_progress_bar from kwargs since we're handling it via callbacks
+    if 'enable_progress_bar' in trainer_kwargs:
+        del trainer_kwargs['enable_progress_bar']
     trainer_kwargs['callbacks'] = callbacks
     
-    # Add resume_from_checkpoint if needed
-    if resume_checkpoint_path:
-        trainer_kwargs['resume_from_checkpoint'] = resume_checkpoint_path
-    
+    # Create the trainer with filtered arguments
     trainer = Trainer(**trainer_kwargs)
-    
+
     # Initialize model arguments
     dict_args = vars(args)
     
@@ -886,7 +885,10 @@ def main():
             )
 
     # Start training with properly configured trainer
-    trainer.fit(model)
+    if resume_checkpoint_path:
+        trainer.fit(model, ckpt_path=resume_checkpoint_path)
+    else:
+        trainer.fit(model)
 
 
 if __name__ == "__main__":
