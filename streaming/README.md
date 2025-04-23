@@ -1,4 +1,4 @@
-## Simple Piper Streaming Server with simplpe HTML/Javascript or NodeJS client
+## Simple Piper Streaming FastAPI Server with HTML/Javascript or NodeJS client
 (work in progress, maybe buggy. Please feedback)
 
 ### Server Component (FastAPI)
