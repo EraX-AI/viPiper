@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Piper TTS Streaming Demo</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .container {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        textarea {
+            width: 100%;
+            height: 150px;
+            margin-bottom: 10px;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            resize: vertical;
+        }
+        .controls {
+            display: flex;
+            margin-bottom: 20px;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        .control-group {
+            flex: 1;
+            min-width: 200px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        select, input {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            margin-right: 10px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .buttons {
+            display: flex;
+            justify-content: space-between;
+        }
+        .status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+            background-color: #f8f9fa;
+            border-left: 4px solid #6c757d;
+        }
+        .audio-visualizer {
+            width: 100%;
+            height: 60px;
+            background-color: #f0f0f0;
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+            margin-top: 20px;
+        }
+        .visualizer-bars {
+            display: flex;
+            height: 100%;
+            justify-content: space-between;
+            align-items: flex-end;
+            padding: 0 2px;
+        }
+        .bar {
+            background-color: #4CAF50;
+            width: 3px;
+            margin: 0 1px;
+            height: 5px;
+            transition: height 0.1s ease;
+        }
+        input[type="range"] {
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Piper TTS Streaming Demo</h1>
+        
+        <div class="controls">
+            <div class="control-group">
+                <label for="speaker">Speaker Voice:</label>
+                <select id="speaker">
+                    <option value="vi_male">Vietnamese Male</option>
+                    <option value="vi_female">Vietnamese Female</option>
+                </select>
+            </div>
+            
+            <div class="control-group">
+                <label for="length-scale">Length Scale: <span id="length-value">1.0</span></label>
+                <input type="range" id="length-scale" min="0.5" max="2" step="0.1" value="1.0">
+            </div>
+            
+            <div class="control-group">
+                <label for="noise-scale">Noise Scale: <span id="noise-value">0.667</span></label>
+                <input type="range" id="noise-scale" min="0.1" max="1.0" step="0.001" value="0.667">
+            </div>
+            
+            <div class="control-group">
+                <label for="noise-w-scale">Noise W Scale: <span id="noise-w-value">0.8</span></label>
+                <input type="range" id="noise-w-scale" min="0.1" max="1.0" step="0.1" value="0.8">
+            </div>
+        </div>
+        
+        <textarea id="text-input" placeholder="Enter text to synthesize...">Trước tình hình tăng giá xăng dầu, Ban Dân Nguyện kiến nghị Uỷ ban thường vụ Quốc Hội đề nghị Chính phủ, Thủ tướng Chính phủ quan tâm chỉ đạo Bộ Công thương, Bộ Tài chính và các Bộ ngành liên quan</textarea>
+        
+        <div class="buttons">
+            <div>
+                <button id="speak-button">Speak</button>
+                <button id="stop-button" disabled>Stop</button>
+            </div>
+            <button id="clear-button">Clear</button>
+        </div>
+        
+        <div class="audio-visualizer">
+            <div class="visualizer-bars" id="visualizer"></div>
+        </div>
+        
+        <div class="status" id="status">Ready</div>
+    </div>
+
+    <script>
+        // Configuration
+        const API_URL = 'http://localhost:8000';
+        
+        // DOM Elements
+        const speakButton = document.getElementById('speak-button');
+        const stopButton = document.getElementById('stop-button');
+        const clearButton = document.getElementById('clear-button');
+        const textInput = document.getElementById('text-input');
+        const speakerSelect = document.getElementById('speaker');
+        const lengthScale = document.getElementById('length-scale');
+        const lengthValue = document.getElementById('length-value');
+        const noiseScale = document.getElementById('noise-scale');
+        const noiseValue = document.getElementById('noise-value');
+        const noiseWScale = document.getElementById('noise-w-scale');
+        const noiseWValue = document.getElementById('noise-w-value');
+        const statusElement = document.getElementById('status');
+        const visualizer = document.getElementById('visualizer');
+        
+        // Audio context and elements
+        let audioContext;
+        let audioBufferQueue = [];
+        let audioSource = null;
+        let isPlaying = false;
+        let audioAnalyser = null;
+        let visualizerBars = [];
+        let audioChunks = [];
+        
+        // Create visualizer bars
+        function initVisualizer() {
+            for (let i = 0; i < 50; i++) {
+                const bar = document.createElement('div');
+                bar.className = 'bar';
+                visualizer.appendChild(bar);
+                visualizerBars.push(bar);
+            }
+        }
+        
+        // Initialize the audio context
+        function initAudio() {
+            // Create AudioContext on user interaction to comply with autoplay policies
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            
+            // Create analyzer for visualizer
+            audioAnalyser = audioContext.createAnalyser();
+            audioAnalyser.fftSize = 256;
+            audioAnalyser.connect(audioContext.destination);
+            
+            updateVisualizer();
+        }
+        
+        // Update the audio visualizer
+        function updateVisualizer() {
+            if (!audioAnalyser || !isPlaying) {
+                // Set all bars to minimum height when not playing
+                visualizerBars.forEach(bar => {
+                    bar.style.height = '5px';
+                });
+                return;
+            }
+            
+            const bufferLength = audioAnalyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            audioAnalyser.getByteFrequencyData(dataArray);
+            
+            // Update bar heights based on frequency data
+            for (let i = 0; i < visualizerBars.length; i++) {
+                const index = Math.floor(i * bufferLength / visualizerBars.length);
+                const value = dataArray[index];
+                const height = Math.max(value / 255 * 60, 5);
+                visualizerBars[i].style.height = `${height}px`;
+            }
+            
+            requestAnimationFrame(updateVisualizer);
+        }
+        
+        // Play the next audio chunk from the queue
+        function playNextChunk() {
+            if (audioBufferQueue.length === 0 || !isPlaying) {
+                isPlaying = false;
+                speakButton.disabled = false;
+                stopButton.disabled = true;
+                statusElement.textContent = "Playback complete";
+                return;
+            }
+            
+            const audioData = audioBufferQueue.shift();
+            
+            // Decode the audio data
+            audioContext.decodeAudioData(audioData)
+                .then(buffer => {
+                    if (!isPlaying) return;
+                    
+                    // Create a new source for this chunk
+                    const source = audioContext.createBufferSource();
+                    source.buffer = buffer;
+                    source.connect(audioAnalyser);
+                    
+                    // When this chunk ends, play the next one
+                    source.onended = playNextChunk;
+                    
+                    // Start playing
+                    source.start(0);
+                    audioSource = source;
+                })
+                .catch(error => {
+                    console.error("Error decoding audio data:", error);
+                    playNextChunk(); // Skip problematic chunk
+                });
+        }
+        
+        // Stream and play audio from the API
+        async function streamAndPlayAudio() {
+            if (!textInput.value.trim()) {
+                statusElement.textContent = "Please enter some text";
+                return;
+            }
+            
+            try {
+                // Clear previous audio chunks
+                audioChunks = [];
+                audioBufferQueue = [];
+                isPlaying = true;
+                
+                // Initialize audio on first play
+                if (!audioContext) {
+                    initAudio();
+                } else if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
+                
+                // UI state
+                speakButton.disabled = true;
+                stopButton.disabled = false;
+                statusElement.textContent = "Generating speech...";
+                
+                // Prepare request
+                const requestData = {
+                    text: textInput.value,
+                    speaker: speakerSelect.value,
+                    length_scale: parseFloat(lengthScale.value),
+                    noise_scale: parseFloat(noiseScale.value),
+                    noise_scale_w: parseFloat(noiseWScale.value)
+                };
+                
+                // Make streaming request
+                const response = await fetch(`${API_URL}/tts/stream`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(requestData)
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                
+                // Get the reader for streaming
+                const reader = response.body.getReader();
+                
+                // Read chunks as they arrive
+                let decoder = new TextDecoder('utf-8');
+                while (isPlaying) {
+                    const { value, done } = await reader.read();
+                    
+                    if (done) {
+                        statusElement.textContent = "Received all audio data";
+                        break;
+                    }
+                    
+                    // Add to audio chunks
+                    audioChunks.push(value);
+                    
+                    // Add to playback queue
+                    audioBufferQueue.push(value.buffer);
+                    
+                    // Start playing if this is the first chunk or playback is stalled
+                    if (audioBufferQueue.length === 1 && isPlaying) {
+                        statusElement.textContent = "Playing audio...";
+                        playNextChunk();
+                    }
+                }
+            } catch (error) {
+                console.error("Streaming error:", error);
+                statusElement.textContent = `Error: ${error.message}`;
+                isPlaying = false;
+                speakButton.disabled = false;
+                stopButton.disabled = true;
+            }
+        }
+        
+        // Stop playback
+        function stopPlayback() {
+            isPlaying = false;
+            
+            // Stop current source if playing
+            if (audioSource) {
+                audioSource.onended = null;
+                audioSource.stop();
+                audioSource = null;
+            }
+            
+            // Clear queue
+            audioBufferQueue = [];
+            
+            // Update UI
+            speakButton.disabled = false;
+            stopButton.disabled = true;
+            statusElement.textContent = "Playback stopped";
+        }
+        
+        // Event listeners
+        speakButton.addEventListener('click', streamAndPlayAudio);
+        stopButton.addEventListener('click', stopPlayback);
+        clearButton.addEventListener('click', () => {
+            textInput.value = '';
+            stopPlayback();
+        });
+        
+        // Update displayed values for sliders
+        lengthScale.addEventListener('input', () => {
+            lengthValue.textContent = lengthScale.value;
+        });
+        
+        noiseScale.addEventListener('input', () => {
+            noiseValue.textContent = noiseScale.value;
+        });
+        
+        noiseWScale.addEventListener('input', () => {
+            noiseWValue.textContent = noiseWScale.value;
+        });
+        
+        // Initialize
+        initVisualizer();
+        
+        // Health check to verify API connection
+        async function checkApiHealth() {
+            try {
+                const response = await fetch(`${API_URL}/health`);
+                const data = await response.json();
+                
+                if (data.status === 'ok') {
+                    statusElement.textContent = "Connected to TTS server";
+                } else {
+                    statusElement.textContent = "Warning: TTS server is available but model is not loaded";
+                }
+            } catch (error) {
+                statusElement.textContent = "Error: Cannot connect to TTS server";
+                console.error("API health check failed:", error);
+            }
+        }
+        
+        // Check API health on load
+        window.addEventListener('load', checkApiHealth);
+    </script>
+</body>
+</html>
