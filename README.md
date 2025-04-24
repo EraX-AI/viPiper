@@ -40,7 +40,9 @@ WORLD_SIZE=4 python3 -m piper_train --dataset-dir /data/piper/steve_combined_mul
 
 **Streaming:**
 ```
-pip install fastapi uvicorn piper-tts langchain underthesea vinorm
+# pip install fastapi uvicorn piper-tts langchain underthesea vinorm
+# Edit f5tts-fastapi-server.py and change model checkpoint, reference audio and reference text (as many as you like and name them well), then simply call:
+
 python f5tts-fastapi-server.py <-- check port inside this file
 ```
 
