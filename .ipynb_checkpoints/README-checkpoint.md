@@ -12,6 +12,7 @@ Built upon the strong foundation of the Piper TTS project (https://github.com/rh
 *   **Precision Finetuning:** Expanded parameters and monitoring tools provide deeper insights and control over the training process.
 *   **Efficient Checkpointing:** Save precisely the checkpoints you need with `max_epoch_keeps`.
 *   **Audible Progress:** Regularly generated audio samples (`sample_steps`) let you hear the model evolve during training.
+*   **Streaming**: simple streaming FastAPI and HTML/Javascript and NodJS server-side
 *   A clean, fully checked **docker**
 ```
 docker run --rm -it --gpus '"device=0,1,2,3"' --shm-size 64G -v ./data:/data thusinh1969/piper_prune_v1:latest bash
